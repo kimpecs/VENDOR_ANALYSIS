@@ -1,0 +1,25 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Vendor Dashboard",
+			"type": "shell",
+			"command": "streamlit run vendor_app.py"
+		},
+		{
+			"label": "Install Streamlit",
+			"type": "shell",
+			"command": "pip install streamlit"
+		},
+		{
+			"label": "Install Streamlit with Python",
+			"type": "shell",
+			"command": "python -m pip install streamlit"
+		},
+		{
+			"label": "Run Vendor Dashboard with Full Path",
+			"type": "shell",
+			"command": "& 'c:\\users\\kpecco\\appdata\\local\\python\\pythoncore-3.14-64\\Scripts\\streamlit.exe' run vendor_app.py"
+		}
+	]
+}
