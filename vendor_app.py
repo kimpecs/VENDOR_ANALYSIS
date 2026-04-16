@@ -48,7 +48,7 @@ html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; font-size
 /* Metric cards */
 div[data-testid="metric-container"] {
     background: #1a1814; border: 1px solid #1f2230;
-    border-radius: 10px; padding: 16px 20px;
+    border-radius: 10px; padding: 16px 20px; 
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
 div[data-testid="metric-container"] label {
@@ -146,13 +146,15 @@ DEFAULT_PT_LEAD_DAYS = 90
 def load_data():
     d = {}
     files = {
-        "master":  "02_sage_master.csv",
-        "po":      "01_po_transactions.csv",
-        "lead":    "01b_po_lead_time_summary.csv",
-        "pt_cat":  "03_CPL_catalogue.csv",
-        "metabo":  "04_metabo_prices.csv",
-        "ronix":   "05_ronix_prices.csv",
-        "combined":"06_combined_vendor_prices.csv",
+        "master":   "02_sage_master.csv",
+        "po":       "01_po_transactions.csv",
+        "lead":     "01b_po_lead_time_summary.csv",
+        "pt_cat":   "03_CPL_catalogue.csv",
+        "metabo":   "04_metabo_prices.csv",
+        "ronix":    "05_ronix_prices.csv",
+        "combined": "06_combined_vendor_prices.csv",
+        "matched":  "07_matched_vendor_prices.csv",   # pre-computed by load_vendor_data.py
+        "cross":    "08_cross_vendor_matches.csv",    # cross-vendor pairs
     }
     for key, fname in files.items():
         f = DATA_DIR / fname
@@ -171,6 +173,119 @@ def load_data():
                 df["item_number"] = df["item_number"].str.strip()
             d[key] = df
     return d
+
+
+@st.cache_data(show_spinner=False)
+def build_vendor_match_table(_data, category_filter="— All —"):
+    """
+    Build the vendor match table from pre-computed 07_matched_vendor_prices.csv.
+    Fast — just filters and pivots. No live fuzzy matching.
+    """
+    master  = _data.get("master")
+    matched = _data.get("matched")
+
+    if master is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    if matched is None or matched.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = matched.copy()
+
+    # Normalise vendor name — file may have "CPL35" or "CPL", "Ronix" etc.
+    if "vendor" in df.columns:
+        df["vendor"] = df["vendor"].astype(str).str.strip()
+        df["vendor"] = df["vendor"].replace({
+            "CPL35": "Workpro", "cpl": "Workpro", "cpl35": "Workpro", "CPL": "Workpro",
+            "metabo": "Metabo", "METABO": "Metabo",
+            "ronix": "Ronix", "RONIX": "Ronix",
+        })
+
+    # Price column: combined file uses vendor_price_usd; Ronix may have
+    # estimated_landed_price_usd. Resolve to one column.
+    if "vendor_price_usd" not in df.columns:
+        for alt in ["estimated_landed_price_usd", "fob_unit_price_usd",
+                    "pt_cpl35_price", "pt_current_price"]:
+            if alt in df.columns:
+                df["vendor_price_usd"] = df[alt]
+                break
+
+    # Attach sub-category from master
+    cat_col = "Sub Category Name" if "Sub Category Name" in master.columns else None
+    if cat_col:
+        cat_map = master.set_index("ITEMNO")[cat_col].to_dict()
+        df["sub_category"] = df["sage_ITEMNO"].map(cat_map).fillna("Unknown")
+    else:
+        df["sub_category"] = "Unknown"
+
+    if category_filter != "— All —":
+        df = df[df["sub_category"] == category_filter]
+
+    # Get PT items for this category
+    pt_items = master.copy()
+    if category_filter != "— All —" and cat_col:
+        pt_items = pt_items[pt_items[cat_col] == category_filter]
+    pt_items = (
+        pt_items[["ITEMNO", "item_description", "performance_tool_price"]]
+        .drop_duplicates("ITEMNO")
+        .head(100)
+    )
+
+    if pt_items.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows = []
+    chart_rows = []
+    added_chart_pt = set()   # track PT items already added to chart
+
+    for _, pt_row in pt_items.iterrows():
+        ino     = str(pt_row["ITEMNO"]).strip()
+        pt_desc = str(pt_row.get("item_description", ""))
+        pt_cost = pd.to_numeric(pt_row.get("performance_tool_price", 0), errors="coerce") or 0
+
+        item_matches = df[df["sage_ITEMNO"].astype(str).str.strip() == ino]
+
+        row = {
+            "ITEMNO":         ino,
+            "PT Description": pt_desc,
+            "PT Cost (USD)":  f"${pt_cost:.2f}" if pt_cost else "—",
+        }
+
+        lbl = (pt_desc[:35] + "…") if len(pt_desc) > 35 else pt_desc
+        has_any_match = False
+
+        for v in ["Workpro", "Metabo", "Ronix"]:
+            vm = item_matches[item_matches["vendor"] == v]
+            if not vm.empty:
+                best = vm.sort_values("match_score", ascending=False).iloc[0]
+                vp   = pd.to_numeric(best.get("vendor_price_usd", None), errors="coerce")
+                row[f"{v} Match"]      = str(best.get("item_description", "—"))[:60]
+                row[f"{v} Cost (USD)"] = f"${vp:.2f}" if pd.notna(vp) and vp > 0 else "—"
+                row[f"{v} Match %"]    = f"{float(best.get('match_score', 0)):.0f}%"
+                has_any_match = True
+                if pd.notna(vp) and vp > 0:
+                    if ino not in added_chart_pt and pt_cost:
+                        chart_rows.append({"Item": lbl, "Vendor": "Performance Tools",
+                                           "Cost (USD)": pt_cost})
+                        added_chart_pt.add(ino)
+                    vname = "Ronix (FOB)" if v == "Ronix" else v
+                    chart_rows.append({"Item": lbl, "Vendor": vname, "Cost (USD)": float(vp)})
+            else:
+                row[f"{v} Match"]      = "—"
+                row[f"{v} Cost (USD)"] = "—"
+                row[f"{v} Match %"]    = "—"
+
+        # Only include items that have at least one match
+        if has_any_match:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    chart_df = (pd.DataFrame(chart_rows)
+                .drop_duplicates(subset=["Item", "Vendor"])
+                if chart_rows else pd.DataFrame())
+    return pd.DataFrame(rows), chart_df
 
 
 @st.cache_data(show_spinner=False)
@@ -347,11 +462,11 @@ def sidebar(data):
 
     page = st.sidebar.radio("Navigate", [
         "Overview",
+        "Vendor Comparison",
         "Scoring & Ranking",
         "Predictions & PO Timing",
         "Price Analysis",
         "Item Deep Dive",
-        "Vendor Comparison",
     ], label_visibility="collapsed")
 
     st.sidebar.markdown("<hr style='border-color:#1f2230;margin:16px 0;'>", unsafe_allow_html=True)
@@ -385,7 +500,7 @@ def sidebar(data):
         "Data Status</span>", unsafe_allow_html=True
     )
     for label, key in [("Sage Master","master"),("PO Transactions","po"),
-                        ("PT Catalogue","pt_cat"),("Metabo","metabo"),("Ronix","ronix")]:
+                        ("Workpro Catalogue","pt_cat"),("Metabo","metabo"),("Ronix","ronix")]:
         ok = key in data
         st.sidebar.markdown(
             f"<div style='font-family:IBM Plex Mono,monospace;font-size:11px;"
@@ -408,37 +523,50 @@ def page_overview(data, scores):
         st.warning("No Sage master data found. Run load_vendor_data.py first.")
         return
 
-    # Use Sub Category Name where available
     cat_col = "Sub Category Name" if "Sub Category Name" in master.columns else "CATEGORY"
 
+    # ── Context ──────────────────────────────────────────────────────────────
     st.markdown(
-        "<div class='context-box'><h4>What you're looking at</h4>"
-        "<p>A high-level snapshot of your Performance Tool catalogue performance. "
-        "All revenue figures are in JMD (Jamaican Dollars). "
-        "Scores are composite indexes — Movement reflects how well items sell, "
-        "Profitability reflects margin, Convenience reflects lead time.</p></div>",
+        "<div class='context-box'>"
+        "<h4>About this Report</h4>"
+        "<p>This dashboard assesses the current Performance Tools (PT) catalogue "
+        "and evaluates three potential new vendors — CPL, Metabo, and Ronix — "
+        "against it. The goal is to identify which PT items have viable alternatives, "
+        "where cost savings exist, and which items should be prioritised for reorder.</p>"
+        "<p style='margin-top:8px;'>All revenue figures are in <strong>JMD (Jamaican Dollars)</strong>. "
+        "Vendor costs are in <strong>USD</strong> unless noted. "
+        "Data sourced from Sage ERP export and vendor price lists (Jan 2026).</p>"
+        "</div>",
         unsafe_allow_html=True
     )
 
-    # KPIs
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # ── KPIs ─────────────────────────────────────────────────────────────────
     total_rev = sum(
         master[f"total_revenue_{y}"].sum()
         for y in YEARS if f"total_revenue_{y}" in master.columns
     )
-    c1.metric("Active Items",        f"{len(master):,}")
-    c2.metric("Total Revenue (JMD)", f"${total_rev:,.0f}")
-    c3.metric("Lifetime Volume",
-              f"{master['lifetime_total_volume'].sum():,.0f}"
-              if "lifetime_total_volume" in master.columns else "N/A")
-    c4.metric("Avg Selling Price",
-              f"${master['lifetime_avg_price'].mean():,.2f}"
-              if "lifetime_avg_price" in master.columns else "N/A")
-    c5.metric("Vendors Assessed",    "1 current  (3 pending)")
+    kpis = [
+        ("Active Items",         f"{len(master):,}"),
+        ("Total Revenue (JMD)",  f"${total_rev:,.0f}"),
+        ("Lifetime Volume",      f"{master['lifetime_total_volume'].sum():,.0f}" if "lifetime_total_volume" in master.columns else "N/A"),
+        ("Avg Selling Price",    f"${master['lifetime_avg_price'].mean():,.2f}" if "lifetime_avg_price" in master.columns else "N/A"),
+        ("Vendors Assessed",     "1 current  (3 pending)"),
+    ]
+    cols = st.columns(5)
+    for col, (label, val) in zip(cols, kpis):
+        col.markdown(
+            f"<div style='background:#1a1814;border:1px solid #1f2230;border-radius:10px;"
+            f"padding:16px 20px;'>"
+            f"<div style='font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:0.1em;"
+            f"text-transform:uppercase;color:#f4f2ed;'>{label}</div>"
+            f"<div style='font-family:Syne,sans-serif;font-size:1.8rem;font-weight:600;"
+            f"color:#f4f2ed;margin-top:4px;'>{val}</div></div>",
+            unsafe_allow_html=True
+        )
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    # Revenue by year
+    # ── Revenue by year ───────────────────────────────────────────────────────
     rev_rows = []
     for y in YEARS:
         col = f"total_revenue_{y}"
@@ -450,16 +578,10 @@ def page_overview(data, scores):
             st.info("No revenue columns found.")
             return
         df_r = pd.DataFrame(rev_rows)
-        fig = px.bar(
-            df_r, x="Year", y="Revenue (JMD)",
-            color_discrete_sequence=["#2563eb"],
-            text="Revenue (JMD)",
-        )
-        fig.update_traces(
-            texttemplate="$%{text:,.0f}",
-            textposition="outside",
-            marker_line_width=0,
-        )
+        fig = px.bar(df_r, x="Year", y="Revenue (JMD)",
+                     color_discrete_sequence=["#2563eb"], text="Revenue (JMD)")
+        fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside",
+                          marker_line_width=0)
         fig.update_xaxes(type="category", tickvals=[str(y) for y in YEARS])
         fig.update_yaxes(tickprefix="$", tickformat=",.0f")
         fig.update_layout(**plotly_defaults(), height=320)
@@ -467,10 +589,8 @@ def page_overview(data, scores):
 
     chart_container(
         "Annual Revenue (JMD)",
-        "<strong>What this shows:</strong> Total revenue generated by your Performance Tool "
-        "catalogue each calendar year from 2020 to 2026 in Jamaican Dollars. "
-        "Each bar = one full year of sales across all active items. "
-        "A rising trend signals healthy category growth; a dip may reflect stock-outs or market shifts.",
+        "Total revenue from the Performance Tools catalogue each year (JMD). "
+        "Each bar = one full calendar year across all active items.",
         _rev_chart
     )
 
@@ -488,22 +608,16 @@ def page_overview(data, scores):
                 .sum().sort_values(ascending=True).tail(12).reset_index()
             )
             cat_df.columns = ["Category", "Revenue (JMD)"]
-            fig = px.bar(
-                cat_df, y="Category", x="Revenue (JMD)", orientation="h",
-                color="Revenue (JMD)", color_continuous_scale="Blues",
-                labels={"Revenue (JMD)": "Revenue (JMD)"},
-            )
-            fig.update_layout(**plotly_defaults(), height=380,
-                              coloraxis_showscale=False)
+            fig = px.bar(cat_df, y="Category", x="Revenue (JMD)", orientation="h",
+                         color="Revenue (JMD)", color_continuous_scale="Blues")
+            fig.update_layout(**plotly_defaults(), height=380, coloraxis_showscale=False)
             fig.update_xaxes(tickprefix="$", tickformat=",.0f")
             st.plotly_chart(fig, use_container_width=True)
 
         chart_container(
             "Top Sub-Categories by Lifetime Revenue",
-            "<strong>What this shows:</strong> Your 12 highest-revenue sub-categories "
-            "ranked by total lifetime sales in JMD. Longer bars = bigger contributors to "
-            "your catalogue's revenue. Use this to quickly identify which product types "
-            "are your core business and deserve priority in vendor negotiations.",
+            "The 12 highest-revenue sub-categories ranked by total lifetime sales (JMD). "
+            "Longer bars = bigger revenue contributors.",
             _cat_chart
         )
 
@@ -513,23 +627,50 @@ def page_overview(data, scores):
                 st.info("Scores not yet available.")
                 return
             tier_counts = scores["tier"].value_counts().reset_index()
-            tier_counts.columns = ["Tier","Count"]
-            color_map = {"High":"#16a34a","Medium":"#d97706","Low":"#dc2626"}
-            fig = px.pie(
-                tier_counts, names="Tier", values="Count",
-                color="Tier", color_discrete_map=color_map,
-                hole=0.55,
-            )
+            tier_counts.columns = ["Tier", "Count"]
+            color_map = {"High": "#16a34a", "Medium": "#d97706", "Low": "#dc2626"}
+            fig = px.pie(tier_counts, names="Tier", values="Count",
+                         color="Tier", color_discrete_map=color_map, hole=0.55)
             fig.update_layout(**plotly_defaults(), height=380, showlegend=True)
             st.plotly_chart(fig, use_container_width=True)
 
         chart_container(
             "Item Viability Tier Breakdown",
-            "<strong>What this shows:</strong> How your catalogue items are distributed "
-            "across High / Medium / Low viability tiers based on the composite score "
-            "(weighted blend of movement, profitability, and convenience). "
-            "Adjust the score weights in the sidebar to see how the distribution shifts.",
+            "Distribution across High / Medium / Low viability tiers based on the "
+            "composite score. Adjust weights in the sidebar to explore scenarios.",
             _score_chart
+        )
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ── Definitions ───────────────────────────────────────────────────────────
+    st.markdown("### Key Definitions")
+    defs = [
+        ("Composite Score",       "0–1 index combining Movement, Profitability, and Convenience. "
+                                  "Higher = more commercially valuable. Weights adjustable in sidebar."),
+        ("Movement Score",        "How well an item sells. Weighted average of 3-year revenue (40%), "
+                                  "unit volume (30%), and transaction frequency (30%), 2022–2024."),
+        ("Profitability Score",   "Estimated gross margin %. Uses lifetime average sell price vs PT cost. "
+                                  "Formula: (Sell − Cost) / Sell × 100."),
+        ("Convenience Score",     "Inverse of average lead time from PO history. Faster delivery = higher score. "
+                                  "Items with no PO history default to mid-range."),
+        ("Viability Tier",        "High = composite > 0.66 · Medium = 0.33–0.66 · Low = < 0.33."),
+        ("PT Cost",               "Workpro price list (USD, Jan 2026). Same catalogue used for Performance Tools cost comparison."),
+        ("Vendor Match Score",    "Fuzzy similarity (0–100%) between PT item number and vendor item number. "
+                                  "Three passes are run; matches ≥ 80% are validated against item descriptions."),
+        ("FOB Price (Ronix)",     "Free On Board — price at port of origin (Iran). Does not include freight, "
+                                  "insurance, or import duty. Apply the freight factor slider to estimate landed cost."),
+        ("JMD",                   "Jamaican Dollar. All revenue and sell-price figures are in JMD. "
+                                  "Vendor costs are in USD unless stated."),
+    ]
+    for term, definition in defs:
+        st.markdown(
+            f"<div style='padding:10px 0;border-bottom:1px solid #1f2230;'>"
+            f"<span style='font-family:IBM Plex Mono,monospace;font-size:12px;"
+            f"color:#93c5fd;font-weight:600;'>{term}</span>"
+            f"<span style='font-size:13px;color:#d4d0c8;margin-left:12px;'>{definition}</span>"
+            f"</div>",
+            unsafe_allow_html=True
         )
 
 
@@ -595,15 +736,10 @@ def page_scoring(data, scores):
                      "Low":"background:#fee2e2;color:#991b1b"}
                 return m.get(v,"")
 
-            styled = (
-                top.style
-                .format({c: "{:.3f}" for c in
-                         ["composite_score","movement_score",
-                          "profitability_score","convenience_score"]
-                         if c in top.columns})
-                .apply(lambda x: x.map(_tier_style), subset=["tier"] if "tier" in top.columns else [])
-            )
-            st.dataframe(styled, width='stretch', height=440)
+            for nc in ["composite_score","movement_score","profitability_score","convenience_score"]:
+                if nc in top.columns:
+                    top[nc] = top[nc].round(3)
+            st.dataframe(top, use_container_width=True, height=440)
 
         chart_container(
             "Top 25 Items — Composite Score",
@@ -679,10 +815,15 @@ def page_scoring(data, scores):
             "composite_score","movement_score","profitability_score",
             "convenience_score","tier"]
     avail = [c for c in disp if c in filt.columns]
-    st.dataframe(
-        filt[avail].sort_values("composite_score", ascending=False),
-        use_container_width=True, height=380
-    )
+
+    # Round numeric cols for display — avoid slow pandas styler
+    display_df = filt[avail].sort_values("composite_score", ascending=False).copy()
+    for nc in ["composite_score","movement_score","profitability_score","convenience_score"]:
+        if nc in display_df.columns:
+            display_df[nc] = display_df[nc].round(3)
+
+    st.markdown(f"**{len(display_df):,} items** match the current filters.")
+    st.dataframe(display_df, use_container_width=True, height=420)
 
 
 # ===========================================================================
@@ -851,12 +992,13 @@ def page_predictions(data, preds, scores):
         "monthly_demand_2026": "{:.1f} units",
         "reorder_point_units": "{:.0f} units",
     }
-    st.dataframe(
-        df_filtered[avail_cols]
-        .sort_values("rev_pred_2026", ascending=False)
-        .style.format({k: v for k, v in fmt.items() if k in avail_cols}),
-        use_container_width=True, height=420
-    )
+    disp_po = df_filtered[avail_cols].sort_values("rev_pred_2026", ascending=False).copy()
+    # Round for readability without slow styler
+    for col, rnd in [("rev_pred_2026",0),("current_sell_price",2),
+                     ("avg_lead_time_days",0),("monthly_demand_2026",1),("reorder_point_units",0)]:
+        if col in disp_po.columns:
+            disp_po[col] = disp_po[col].round(rnd)
+    st.dataframe(disp_po, use_container_width=True, height=420)
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -903,9 +1045,8 @@ def page_price_analysis(data, ronix_ff):
     pt_cat = data.get("pt_cat")
     ronix  = data.get("ronix")
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab3 = st.tabs([
         "📅  Year-over-Year Price Trend",
-        "🔄  Vendor Price Comparison",
         "📐  Margin Analysis",
     ])
 
@@ -967,111 +1108,6 @@ def page_price_analysis(data, ronix_ff):
                     use_container_width=True
                 )
 
-    # ---- TAB 2: Vendor Price Comparison ----
-    with tab2:
-        st.markdown("")
-        st.markdown(
-            "<div class='chart-desc'><strong>What this shows:</strong> A scatter plot of "
-            "your average selling price (Y-axis) vs the Performance Tool CPL35 cost price "
-            "(X-axis) for each matched item. The dashed diagonal line = break-even (sell "
-            "price equals cost). Dots <em>above</em> the line = positive margin. "
-            "Dots <em>below</em> = you're selling at a loss relative to PT cost — "
-            "those items need immediate attention. Colour intensity shows margin %.</div>",
-            unsafe_allow_html=True
-        )
-
-        if master is not None and pt_cat is not None:
-            if "item_number" in pt_cat.columns and "ITEMNO" in master.columns:
-                price_col = "pt_cpl35_price" if "pt_cpl35_price" in pt_cat.columns else (
-                    "pt_current_price" if "pt_current_price" in pt_cat.columns else None
-                )
-                if price_col is not None:
-                    pc = pt_cat[["item_number", price_col, "item_description"]].dropna(subset=[price_col]).copy()
-                    pc = pc.rename(columns={price_col: "pt_cpl35_price"})
-                    merged = master.merge(pc, left_on="ITEMNO", right_on="item_number", how="inner")
-                    merged = merged[(merged["lifetime_avg_price"] > 0) & (merged["pt_cpl35_price"] > 0)].copy()
-                else:
-                    merged = pd.DataFrame()
-
-                if len(merged):
-                    # Note: lifetime_avg_price is JMD; pt_cpl35_price is USD.
-                    # Load exchange rate if available for fair comparison.
-                    _xrate = None
-                    _xrate_file = DATA_DIR.parent / "Search BOJ Counter Rates.csv"
-                    if _xrate_file.exists():
-                        try:
-                            _xdf = pd.read_csv(_xrate_file)
-                            _xdf["Date"] = pd.to_datetime(_xdf["Date"], format="%d %b %Y", errors="coerce")
-                            _xdf = _xdf.dropna(subset=["Date"]).sort_values("Date")
-                            _xrate = float(_xdf.iloc[-1]["DMD & TT"])
-                        except Exception:
-                            _xrate = None
-
-                    if _xrate and _xrate > 0:
-                        merged["pt_cpl35_price_jmd"] = merged["pt_cpl35_price"] * _xrate
-                        merged["margin_pct"] = (
-                            (merged["lifetime_avg_price"] - merged["pt_cpl35_price_jmd"])
-                            / merged["lifetime_avg_price"] * 100
-                        ).round(1)
-                        cost_col_display = "pt_cpl35_price_jmd"
-                        cost_label = f"Avg PT Cost (JMD @ {_xrate:.2f})"
-                    else:
-                        merged["margin_pct"] = (
-                            (merged["lifetime_avg_price"] - merged["pt_cpl35_price"])
-                            / merged["lifetime_avg_price"] * 100
-                        ).round(1)
-                        cost_col_display = "pt_cpl35_price"
-                        cost_label = "Avg PT CPL35 Cost (USD — exchange rate file not found)"
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Matched Items",    f"{len(merged):,}")
-                    c2.metric("Avg Sell Price (JMD)", f"${merged['lifetime_avg_price'].mean():,.2f}")
-                    c3.metric(cost_label,         f"${merged[cost_col_display].mean():,.2f}")
-                    c4.metric("Items Below Cost", f"{(merged['margin_pct'] < 0).sum():,}")
-
-                    fig = px.scatter(
-                        merged.head(300),
-                        x="pt_cpl35_price", y="lifetime_avg_price",
-                        color="margin_pct",
-                        color_continuous_scale="RdYlGn",
-                        range_color=[-20, 60],
-                        hover_name="item_description_x",
-                        hover_data={"margin_pct": ":.1f%"},
-                        labels={
-                            "pt_cpl35_price":     "PT CPL35 Cost",
-                            "lifetime_avg_price": "Your Avg Selling Price",
-                            "margin_pct":         "Margin %",
-                        },
-                    )
-                    max_v = max(merged["pt_cpl35_price"].max(), merged["lifetime_avg_price"].max())
-                    fig.add_shape(type="line", x0=0,y0=0, x1=max_v,y1=max_v,
-                                  line=dict(color="#6b6860",dash="dash",width=1))
-                    fig.update_layout(**plotly_defaults(), height=420,
-                                       coloraxis_colorbar_title="Margin %")
-                    st.plotly_chart(fig, use_container_width=True)
-
-        # Ronix FOB comparison
-        if ronix is not None and "fob_unit_price_usd" in ronix.columns:
-            st.markdown("<hr>", unsafe_allow_html=True)
-            st.markdown(
-                "<div class='chart-desc'><strong>Ronix FOB vs Estimated Landed:</strong> "
-                "Ronix prices are FOB (Free On Board) from Iran — the price does NOT include "
-                "freight, insurance, or import duties to your market. The 'Estimated Landed' "
-                f"column applies your current freight factor ({ronix_ff}×) set in the sidebar. "
-                "Adjust the slider to model different freight scenarios.</div>",
-                unsafe_allow_html=True
-            )
-            r = ronix[["item_number","item_description","fob_unit_price_usd"]].dropna().copy()
-            r["estimated_landed_usd"] = (r["fob_unit_price_usd"] * ronix_ff).round(2)
-            r["freight_uplift_usd"]   = (r["estimated_landed_usd"] - r["fob_unit_price_usd"]).round(2)
-            st.dataframe(
-                r.style.format({
-                    "fob_unit_price_usd":    "${:.2f}",
-                    "estimated_landed_usd":  "${:.2f}",
-                    "freight_uplift_usd":    "+${:.2f}",
-                }),
-                use_container_width=True, height=340
-            )
 
     # ---- TAB 3: Margin Analysis ----
     with tab3:
@@ -1079,7 +1115,7 @@ def page_price_analysis(data, ronix_ff):
         st.markdown(
             "<div class='chart-desc'><strong>What this shows:</strong> Gross margin "
             "distribution across your catalogue — how much profit (as a %) sits "
-            "between your cost (PT CPL35 price) and your average selling price. "
+            "between your cost (Workpro price) and your average selling price. "
             "The red dashed line = catalogue average margin. Items to the left of that "
             "line are below-average margin contributors. The bar chart breaks this down "
             "by sub-category so you can see which product types drive the most profit.</div>",
@@ -1219,7 +1255,7 @@ def page_item_deep_dive(data, scores, preds):
             <p class='sub'>
                 Sub-category: <strong>{row.get(cat_col,'N/A')}</strong> &nbsp;|&nbsp;
                 Unit: <strong>{row.get('STOCKUNIT','N/A')}</strong> &nbsp;|&nbsp;
-                PT CPL35 Cost: <strong>${pt_cost:,.2f}</strong> &nbsp;|&nbsp;
+                Workpro Cost: <strong>${pt_cost:,.2f}</strong> &nbsp;|&nbsp;
                 Current Sell Price ({price_source}): <strong>${current_price:,.2f}</strong> &nbsp;|&nbsp;
                 Gross Margin: <strong>{margin:.1f}%</strong>
             </p>
@@ -1321,7 +1357,7 @@ def page_item_deep_dive(data, scores, preds):
     st.markdown(
         "<div class='chart-desc'><strong>What this shows:</strong> How the average "
         "unit selling price for this item has changed each year. The red dashed line "
-        "is the current PT CPL35 cost — any year where the green line dips below the "
+        "is the current Workpro cost — any year where the green line dips below the "
         "red line means you sold this item at a loss that year.</div>",
         unsafe_allow_html=True
     )
@@ -1334,29 +1370,228 @@ def page_item_deep_dive(data, scores, preds):
                       markers=True, color_discrete_sequence=["#16a34a"])
         if pt_cost > 0:
             fig.add_hline(y=pt_cost, line_dash="dash", line_color="#dc2626",
-                          annotation_text=f"PT Cost ${pt_cost:.2f}",
+                          annotation_text=f"Workpro Cost ${pt_cost:.2f}",
                           annotation_position="bottom right")
         fig.update_xaxes(type="category")
         fig.update_yaxes(tickprefix="$")
         fig.update_layout(**plotly_defaults(), height=240)
         st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # =========================================================================
+    # VENDOR PRICE COMPARISON — toggle between PT view and cross-vendor view
+    # =========================================================================
+    st.markdown("### Vendor Price Comparison")
+
+    matched  = data.get("matched")
+    cross    = data.get("cross")
+    metabo   = data.get("metabo")
+    ronix    = data.get("ronix")
+    workpro  = data.get("pt_cat")
+
+    # ── Toggle: PT vs Vendors  |  Cross-Vendor ───────────────────────────────
+    view_mode = st.radio(
+        "View:",
+        ["Performance Tools vs Vendors", "Cross-Vendor Comparison"],
+        horizontal=True,
+        key="dive_view_toggle",
+    )
+
+    if view_mode == "Performance Tools vs Vendors":
+        # Show what each vendor charges for this item vs what PT charges
+        st.markdown(
+            "<div class='chart-desc'>Shows the best-matched vendor price for this item "
+            "from each new vendor, compared to the current Performance Tools (Workpro) cost.</div>",
+            unsafe_allow_html=True
+        )
+
+        if matched is None or matched.empty:
+            st.info("Run load_vendor_data.py first to generate vendor match data.")
+        else:
+            item_matches = matched[matched["sage_ITEMNO"].astype(str).str.strip() == item_no]
+
+            if item_matches.empty:
+                st.info(f"No vendor matches found for item {item_no}. "
+                        "It may not have reached the 80% match threshold.")
+            else:
+                # Normalise vendor names
+                item_matches = item_matches.copy()
+                item_matches["vendor"] = item_matches["vendor"].astype(str).str.strip()
+                item_matches["vendor"] = item_matches["vendor"].replace({
+                    "CPL35": "Workpro", "CPL": "Workpro", "cpl": "Workpro",
+                    "metabo": "Metabo", "ronix": "Ronix",
+                })
+
+                bar_rows = []
+                if pt_cost > 0:
+                    bar_rows.append({"Vendor": "Performance Tools (current)",
+                                     "Cost (USD)": pt_cost, "Item": "PT Cost",
+                                     "Match %": "—", "Vendor Item": row.get("item_description","")})
+
+                for v in ["Workpro", "Metabo", "Ronix"]:
+                    vm = item_matches[item_matches["vendor"] == v]
+                    if not vm.empty:
+                        best = vm.sort_values("match_score", ascending=False).iloc[0]
+                        vp   = pd.to_numeric(best.get("vendor_price_usd", None), errors="coerce")
+                        if pd.notna(vp) and vp > 0:
+                            vname = f"{v} (FOB)" if v == "Ronix" else v
+                            bar_rows.append({
+                                "Vendor":      vname,
+                                "Cost (USD)":  float(vp),
+                                "Item":        str(best.get("item_description",""))[:60],
+                                "Match %":     f"{float(best.get('match_score',0)):.0f}%",
+                                "Vendor Item": str(best.get("item_number",""))
+                            })
+
+                if bar_rows:
+                    df_bar = pd.DataFrame(bar_rows)
+
+                    # Summary table
+                    st.dataframe(
+                        df_bar[["Vendor","Cost (USD)","Match %","Vendor Item","Item"]],
+                        use_container_width=True, height=200
+                    )
+
+                    # Bar chart
+                    v_colors = {
+                        "Performance Tools (current)": "#2563eb",
+                        "Workpro":    "#f59e0b",
+                        "Metabo":     "#10b981",
+                        "Ronix (FOB)":"#ef4444",
+                    }
+                    fig_v = px.bar(
+                        df_bar, x="Vendor", y="Cost (USD)",
+                        color="Vendor", color_discrete_map=v_colors,
+                        text="Cost (USD)",
+                    )
+                    fig_v.update_traces(
+                        texttemplate="$%{text:.2f}", textposition="outside",
+                        marker_line_width=0, showlegend=False,
+                    )
+                    fig_v.update_yaxes(tickprefix="$", tickformat=",.2f")
+                    _pd_v = plotly_defaults()
+                    _pd_v["margin"] = dict(l=0, r=0, t=30, b=0)
+                    fig_v.update_layout(**_pd_v, height=300)
+                    st.plotly_chart(fig_v, use_container_width=True)
+                else:
+                    st.info("No vendor prices available for this item.")
+
+    else:
+        # Cross-vendor comparison: show how vendors match against EACH OTHER for this item
+        st.markdown(
+            "<div class='chart-desc'>Shows matched pairs across Workpro, Metabo, and Ronix "
+            "for items equivalent to this one. Matched by item number and description similarity. "
+            "Helps identify where multiple vendors carry the same product.</div>",
+            unsafe_allow_html=True
+        )
+
+        if cross is None or cross.empty:
+            st.info("Run load_vendor_data.py first to generate cross-vendor match data "
+                    "(processed/08_cross_vendor_matches.csv).")
+        else:
+            # Find cross-vendor rows related to this item
+            # Match on description similarity to the current item description
+            item_desc_lower = str(row.get("item_description", "")).strip().lower()
+
+            def _desc_sim(a, b):
+                from difflib import SequenceMatcher
+                ta = " ".join(sorted(str(a).lower().split()))
+                tb = " ".join(sorted(str(b).lower().split()))
+                return SequenceMatcher(None, ta, tb).ratio() * 100
+
+            cross_copy = cross.copy()
+            cross_copy["_sim_a"] = cross_copy["description_a"].astype(str).apply(
+                lambda d: _desc_sim(item_desc_lower, d)
+            )
+            cross_copy["_sim_b"] = cross_copy["description_b"].astype(str).apply(
+                lambda d: _desc_sim(item_desc_lower, d)
+            )
+            cross_copy["_best_sim"] = cross_copy[["_sim_a","_sim_b"]].max(axis=1)
+
+            # Keep rows where at least one side matches this item's description >= 40%
+            relevant = cross_copy[cross_copy["_best_sim"] >= 40].sort_values(
+                "_best_sim", ascending=False
+            ).head(20)
+
+            if relevant.empty:
+                st.info(f"No cross-vendor matches found for items similar to '{row.get('item_description','')}'. "
+                        "This item may not have equivalents in other vendor catalogues.")
+            else:
+                st.markdown(f"**{len(relevant)} cross-vendor match pairs** found for similar items:")
+
+                disp_cross = relevant[[
+                    "vendor_a", "item_number_a", "description_a", "price_a_usd",
+                    "vendor_b", "item_number_b", "description_b", "price_b_usd",
+                    "item_match_score", "match_method"
+                ]].copy()
+                disp_cross.columns = [
+                    "Vendor A", "Item # A", "Description A", "Price A (USD)",
+                    "Vendor B", "Item # B", "Description B", "Price B (USD)",
+                    "Match Score", "Method"
+                ]
+                for pc in ["Price A (USD)", "Price B (USD)"]:
+                    disp_cross[pc] = pd.to_numeric(disp_cross[pc], errors="coerce").round(2)
+
+                st.dataframe(disp_cross, use_container_width=True, height=300)
+
+                # Price comparison bar for cross-vendor
+                price_rows = []
+                for _, cr in relevant.iterrows():
+                    pa = pd.to_numeric(cr.get("price_a_usd", None), errors="coerce")
+                    pb = pd.to_numeric(cr.get("price_b_usd", None), errors="coerce")
+                    lbl_a = f"{cr['vendor_a']}: {str(cr['description_a'])[:25]}"
+                    lbl_b = f"{cr['vendor_b']}: {str(cr['description_b'])[:25]}"
+                    if pd.notna(pa) and pa > 0:
+                        price_rows.append({"Label": lbl_a, "Vendor": str(cr["vendor_a"]),
+                                           "Cost (USD)": float(pa)})
+                    if pd.notna(pb) and pb > 0:
+                        price_rows.append({"Label": lbl_b, "Vendor": str(cr["vendor_b"]),
+                                           "Cost (USD)": float(pb)})
+
+                if price_rows:
+                    df_cross_bar = pd.DataFrame(price_rows).drop_duplicates(
+                        subset=["Label"]
+                    ).head(16)
+                    cv_colors = {
+                        "Workpro": "#f59e0b", "CPL": "#f59e0b", "CPL35": "#f59e0b",
+                        "Metabo":  "#10b981",
+                        "Ronix":   "#ef4444",
+                    }
+                    fig_c = px.bar(
+                        df_cross_bar, x="Label", y="Cost (USD)",
+                        color="Vendor", color_discrete_map=cv_colors,
+                        text="Cost (USD)",
+                    )
+                    fig_c.update_traces(
+                        texttemplate="$%{text:.2f}", textposition="outside",
+                        marker_line_width=0,
+                    )
+                    fig_c.update_yaxes(tickprefix="$", tickformat=",.2f")
+                    fig_c.update_xaxes(tickangle=-35)
+                    _pd2 = plotly_defaults()
+                    _pd2["legend"] = dict(orientation="h", yanchor="bottom", y=1.02,
+                                          xanchor="right", x=1, font=dict(color="#d4d0c8"))
+                    fig_c.update_layout(**_pd2, height=360)
+                    st.plotly_chart(fig_c, use_container_width=True)
+
 
 # ===========================================================================
-# PAGE 6 — VENDOR COMPARISON
+# PAGE 2 — VENDOR COMPARISON
 # ===========================================================================
 def page_vendor_comparison(data, scores):
     st.markdown("## Vendor Comparison")
     st.markdown(
         "<div class='context-box'><h4>Side-by-side vendor assessment</h4>"
-        "<p>Compares Performance Tools (current), CPL35 (new), Metabo, and Ronix across price, "
-        "lead time, catalogue depth, and risk flags. CPL data comes from the CPL35 Jan 02 price list, "
-        "while Performance Tools data comes from the Performance_Tools master file.</p></div>",
+        "<p>Compares Performance Tools (current), Workpro, Metabo, and Ronix. "
+        "The match table shows PT items alongside the best-matched vendor item in the same sub-category. "
+        "Select a sub-category to filter. KPIs below each matched item show revenue history, "
+        "unit sales, and a cost comparison bar chart.</p></div>",
         unsafe_allow_html=True
     )
 
     master = data.get("master")
-    cpl    = data.get("pt_cat")
+    workpro = data.get("pt_cat")
     po     = data.get("po")
     metabo = data.get("metabo")
     ronix  = data.get("ronix")
@@ -1388,21 +1623,21 @@ def page_vendor_comparison(data, scores):
         normalized = series.astype(str).str.lower().str.strip()
         return int(normalized.isin({"true", "1", "yes", "y", "t"}).sum())
 
-    cpl_count = len(cpl) if cpl is not None else 0
+    cpl_count = len(workpro) if workpro is not None else 0
     cpl_flags = "TBD"
-    if cpl is not None:
-        cpl_exp = count_true_flags(cpl["price_expired"]) if "price_expired" in cpl.columns else 0
-        cpl_po  = count_true_flags(cpl["phase_out_flag"]) if "phase_out_flag" in cpl.columns else 0
+    if workpro is not None:
+        cpl_exp = count_true_flags(workpro["price_expired"]) if "price_expired" in workpro.columns else 0
+        cpl_po  = count_true_flags(workpro["phase_out_flag"]) if "phase_out_flag" in workpro.columns else 0
         cpl_flags = f"{cpl_exp} expired prices · {cpl_po} phase-out items" if (cpl_exp + cpl_po) else "No immediate flags"
 
     profiles = []
     profiles.append({
-        "Vendor":         "CPL",
-        "Country":        "USA",
+        "Vendor":         "Workpro",
+        "Country":        "China",
         "Status":         "New",
         "Catalogue Size": f"{cpl_count:,} items" if cpl_count else "Price list not yet provided",
-        "Avg Lead Time":  "TBD",
-        "Price Basis":    "CPL35 Jan 02 price list" if cpl_count else "TBD",
+        "Avg Lead Time":  "~30–45 days (sea freight)",
+        "Price Basis":    "Workpro Jan 02 2026 price list" if cpl_count else "TBD",
         "Risk Flags":     cpl_flags,
     })
     if metabo is not None:
@@ -1420,7 +1655,7 @@ def page_vendor_comparison(data, scores):
     if ronix is not None:
         profiles.append({
             "Vendor":         "Ronix",
-            "Country":        "Iran",
+            "Country":        "China",
             "Status":         "New",
             "Catalogue Size": f"{len(ronix):,} items",
             "Avg Lead Time":  "~60–90 days (FOB)",
@@ -1431,7 +1666,7 @@ def page_vendor_comparison(data, scores):
     if master is not None:
         profiles.append({
             "Vendor":         "Performance Tools",
-            "Country":        "USA",
+            "Country":        "China",
             "Status":         "Current",
             "Catalogue Size": f"{len(master):,} items",
             "Avg Lead Time":  f"{avg_lt:.0f} days" if avg_lt else f"~{DEFAULT_PT_LEAD_DAYS}d default",
@@ -1484,247 +1719,97 @@ def page_vendor_comparison(data, scores):
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    st.markdown("### Cost Comparison — Performance Tools vs Matched Vendors")
+    st.markdown("### Vendor Match Table")
     st.markdown(
-        "<div class='chart-desc'><strong>What this shows:</strong> Item-level comparison across vendors. "
-        "Two-pass item-number match: <b>Pass 1</b> matches trimmed Sage ITEMNO against vendor item_number (keep ≥80%). "
-        "<b>Pass 2</b> uses the Sage vendor item number from PO history for any items that scored below 80% in pass 1. "
-        "A grouped bar chart shows PT cost vs each matched vendor side-by-side.</div>",
+        "<div class='chart-desc'>Select a sub-category to filter PT items and see their best-matched "
+        "vendor equivalents. Match uses three passes on item numbers (≥80%) validated by description. "
+        "Vendor costs are in USD. PT cost is from the Workpro Jan 2026 price list.</div>",
         unsafe_allow_html=True
     )
 
-    # -----------------------------------------------------------------------
-    # Two-pass fuzzy item-number match
-    # Pass 1: Sage ITEMNO (trimmed) vs vendor item_number  -> keep >= 80%
-    # Pass 2: Sage vendor_item_number (from PO sheet)      -> keep >= 80%
-    # -----------------------------------------------------------------------
-    FUZZY_HIGH = 80
-
-    def _token_sort_score(a: str, b: str) -> float:
-        """SequenceMatcher token-sort ratio 0-100."""
-        ta = " ".join(sorted(str(a).strip().lower().split()))
-        tb = " ".join(sorted(str(b).strip().lower().split()))
-        return SequenceMatcher(None, ta, tb).ratio() * 100
-
-    @st.cache_data(show_spinner=False)
-    def _build_vendor_index(_df, price_col):
-        """Pre-build (item_number_clean, description_clean, price) tuples."""
-        if _df is None or _df.empty:
-            return []
-        rows = []
-        for _, r in _df.iterrows():
-            ino  = str(r.get("item_number", "")).strip().lower()
-            desc = str(r.get("item_description", "")).strip().lower()
-            p    = pd.to_numeric(r.get(price_col, None), errors="coerce")
-            rows.append((ino, desc, float(p) if pd.notna(p) and p > 0 else None, r))
-        return rows
-
-    def best_itemno_match(query: str, vendor_df: pd.DataFrame):
-        """Match query against vendor item_number only (for item-number pass)."""
-        if vendor_df is None or vendor_df.empty or not query.strip():
-            return None, 0
-        best_row, best_score = None, 0.0
-        q = query.strip().lower()
-        for _, vrow in vendor_df.iterrows():
-            s = _token_sort_score(q, str(vrow.get("item_number", "")).strip().lower())
-            if s > best_score:
-                best_score, best_row = s, vrow
-        return best_row, best_score
-
-    def best_desc_match(query_desc: str, vendor_index: list, threshold: float = 55.0):
-        """Match PT item description against vendor item descriptions.
-        Returns (price, score) of the best description match above threshold."""
-        if not query_desc.strip() or not vendor_index:
-            return None, 0
-        best_price, best_score = None, 0.0
-        q = query_desc.strip().lower()
-        for ino, desc, price, _ in vendor_index:
-            if not desc:
-                continue
-            s = _token_sort_score(q, desc)
-            if s > best_score:
-                best_score, best_price = s, price
-        if best_score >= threshold:
-            return best_price, round(best_score, 1)
-        return None, 0
-
-    # Build comparison data
     if master is not None:
-        po = data.get("po")
+        # Sub-category selector
+        cats = sorted([c for c in master["Sub Category Name"].dropna().unique()
+                       if str(c).strip()]) if "Sub Category Name" in master.columns else []
+        if not cats:
+            st.info("No sub-categories found.")
+            return
 
-        # Build sage_vendor_itemno lookup
-        # Primary: vendor_item_number is now baked into 02_sage_master.csv
-        #          (mapped + text-cleaned by load_vendor_data.py at ingest time)
-        # Fallback: PO transactions sheet for any items not in master
-        import re as _re
-        _vin_pat = _re.compile(r"^([A-Za-z0-9][A-Za-z0-9\-\._]*)")
+        sel_cat = st.selectbox("Filter by Sub-Category:", ["— All —"] + cats, key="vc_cat")
 
-        sage_vendor_ino = {}
+        # Check if pre-computed match file exists
+        matched_df = data.get("matched")
+        if matched_df is None or matched_df.empty:
+            st.warning(
+                "⚠️ Pre-computed match file not found. "
+                "Run **load_vendor_data.py** first to generate `processed/07_matched_vendor_prices.csv`, "
+                "then reload this page."
+            )
+            return
 
-        # Source 1 — master CSV (fast, already cleaned)
-        if "vendor_item_number" in master.columns:
-            for _, _mr in master[master["ITEMNO"].notna()].iterrows():
-                k = str(_mr["ITEMNO"]).strip().lower()
-                v = str(_mr.get("vendor_item_number", "")).strip()
-                if v and v.lower() not in ("nan", "none", ""):
-                    sage_vendor_ino[k] = v
+        # Show a quick summary of what's in the matched file
+        total_matched = len(matched_df["sage_ITEMNO"].dropna().unique()) if "sage_ITEMNO" in matched_df.columns else 0
+        st.caption(f"Using pre-computed match file — {total_matched:,} PT items have vendor matches.")
 
-        # Source 2 — PO sheet fallback (strip embedded text on the fly)
-        if po is not None and "vendor_item_number" in po.columns and "ITEMNO" in po.columns:
-            for _, row in po.dropna(subset=["ITEMNO", "vendor_item_number"]).iterrows():
-                k = str(row["ITEMNO"]).strip().lower()
-                if k in sage_vendor_ino:
-                    continue                          # master already has it
-                raw = str(row["vendor_item_number"]).strip()
-                m = _vin_pat.match(raw)
-                v = m.group(1) if m else ""
-                if v and v.lower() not in ("nan", "none", ""):
-                    sage_vendor_ino[k] = v
+        with st.spinner("Building table…"):
+            table_rows_df, chart_rows_df = build_vendor_match_table(data, sel_cat)
 
-        # Pre-filter vendor frames to rows with valid prices
-        cpl_price_col = None
-        cpl_filt = None
-        if cpl is not None and "item_description" in cpl.columns:
-            cpl_price_col = "pt_cpl35_price" if "pt_cpl35_price" in cpl.columns else (
-                "pt_current_price" if "pt_current_price" in cpl.columns else None)
-            if cpl_price_col:
-                cpl_filt = cpl[pd.to_numeric(cpl[cpl_price_col], errors="coerce") > 0].copy()
+        if table_rows_df.empty:
+            st.info(
+                f"No matched items found for '{sel_cat}'. "
+                "Try '— All —' or a different sub-category. "
+                "If all categories show no matches, re-run load_vendor_data.py."
+            )
+            return
 
-        metabo_filt = None
-        if metabo is not None and "item_description" in metabo.columns and "vendor_price_usd" in metabo.columns:
-            metabo_filt = metabo[pd.to_numeric(metabo["vendor_price_usd"], errors="coerce") > 0].copy()
+        table_rows = table_rows_df.to_dict("records")
+        chart_rows = chart_rows_df.to_dict("records") if not chart_rows_df.empty else []
 
-        ronix_filt = None
-        if ronix is not None and "item_description" in ronix.columns:
-            r_pcol = "fob_unit_price_usd" if "fob_unit_price_usd" in ronix.columns else None
-            if r_pcol:
-                ronix_filt = ronix[pd.to_numeric(ronix[r_pcol], errors="coerce") > 0].copy()
-
-        # Category selector
-        if "Sub Category Name" in master.columns:
-            pt_categories = sorted([c for c in master["Sub Category Name"].dropna().unique()
-                                     if pd.notna(c) and str(c).strip()])
-        else:
-            pt_categories = []
-
-        if pt_categories:
-            selected_category = st.selectbox(
-                "Select Performance Tools Category:",
-                options=pt_categories,
-                key="vendor_item_cat"
+        # ── Match table ──────────────────────────────────────────────────────
+        matched_count = sum(
+            1 for r in table_rows
+            if r.get("CPL Match","—") != "—"
+            or r.get("Metabo Match","—") != "—"
+            or r.get("Ronix Match","—") != "—"
+        )
+        m1, m2, m3 = st.columns(3)
+        for col, lbl, val in [
+            (m1, "Items in Category", f"{len(table_rows):,}"),
+            (m2, "Items with ≥1 Match", f"{matched_count:,}"),
+            (m3, "Match Rate", f"{100*matched_count/len(table_rows):.0f}%" if table_rows else "—"),
+        ]:
+            col.markdown(
+                f"<div style='background:#1a1814;border:1px solid #1f2230;border-radius:10px;"
+                f"padding:14px 18px;'><div style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                f"text-transform:uppercase;color:#f4f2ed;'>{lbl}</div>"
+                f"<div style='font-family:Syne,sans-serif;font-size:1.6rem;font-weight:600;"
+                f"color:#f4f2ed;margin-top:4px;'>{val}</div></div>",
+                unsafe_allow_html=True
             )
 
-            pt_items_in_cat = master[
-                (master["Sub Category Name"] == selected_category) &
-                (pd.to_numeric(master["performance_tool_price"], errors="coerce") > 0)
-            ][["ITEMNO", "item_description", "performance_tool_price"]].drop_duplicates("ITEMNO").head(30)
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, height=400)
 
-            if not pt_items_in_cat.empty:
-                st.markdown(f"**{selected_category}** — {len(pt_items_in_cat)} items (showing up to 30)")
-
-                chart_rows = []
-
-                for _, pt_row in pt_items_in_cat.iterrows():
-                    sage_itemno = str(pt_row["ITEMNO"]).strip()
-                    sage_key    = sage_itemno.lower()
-                    pt_desc     = str(pt_row.get("item_description", ""))
-                    pt_price    = float(pd.to_numeric(pt_row["performance_tool_price"], errors="coerce") or 0)
-
-                    def _match_vendor(vendor_df, price_col):
-                        """Three-pass match:
-                        Pass 1 — Sage ITEMNO       vs vendor item_number  (>=80%)
-                        Pass 2 — vendor_item_number vs vendor item_number  (>=80%)
-                        Pass 3 — PT description    vs vendor description   (>=55%)
-                        """
-                        if vendor_df is None or vendor_df.empty:
-                            return None, 0
-
-                        # Pass 1 — Sage ITEMNO vs vendor item_number
-                        row1, sc1 = best_itemno_match(sage_itemno, vendor_df)
-                        if sc1 >= FUZZY_HIGH:
-                            p = pd.to_numeric(row1.get(price_col, None), errors="coerce")
-                            return (float(p) if pd.notna(p) and p > 0 else None), round(sc1, 1)
-
-                        # Pass 2 — Sage vendor_item_number vs vendor item_number
-                        vin = sage_vendor_ino.get(sage_key, "")
-                        if vin:
-                            row2, sc2 = best_itemno_match(vin, vendor_df)
-                            if sc2 >= FUZZY_HIGH:
-                                p = pd.to_numeric(row2.get(price_col, None), errors="coerce")
-                                return (float(p) if pd.notna(p) and p > 0 else None), round(sc2, 1)
-
-                        # Pass 3 — description match (catches Metabo/Ronix whose
-                        #           item numbers don't overlap with PT codes)
-                        vidx = _build_vendor_index(vendor_df, price_col)
-                        p3, sc3 = best_desc_match(pt_desc, vidx, threshold=55.0)
-                        if p3 is not None:
-                            return p3, sc3
-
-                        return None, 0
-
-                    cpl_price,    cpl_score    = _match_vendor(cpl_filt, cpl_price_col) if cpl_filt is not None else (None, 0)
-                    metabo_price, metabo_score = _match_vendor(metabo_filt, "vendor_price_usd") if metabo_filt is not None else (None, 0)
-                    ronix_price,  ronix_score  = _match_vendor(ronix_filt, "fob_unit_price_usd") if ronix_filt is not None else (None, 0)
-
-                    if any([cpl_price, metabo_price, ronix_price]):
-                        label = (pt_desc[:35] + "…") if len(pt_desc) > 35 else pt_desc
-                        if pt_price:
-                            chart_rows.append({"Item": label, "Vendor": "Performance Tools", "Cost (USD)": pt_price})
-                        if cpl_price:
-                            chart_rows.append({"Item": label, "Vendor": "CPL", "Cost (USD)": cpl_price})
-                        if metabo_price:
-                            chart_rows.append({"Item": label, "Vendor": "Metabo", "Cost (USD)": metabo_price})
-                        if ronix_price:
-                            chart_rows.append({"Item": label, "Vendor": "Ronix (FOB)", "Cost (USD)": ronix_price})
-
-                # --- bar chart only (no comparison table) ---
-                if chart_rows:
-                    st.markdown("#### Performance Tools vs Matched Vendors — Cost by Item")
-                    st.markdown(
-                        "<div class='chart-desc'><strong>What this shows:</strong> "
-                        "For each item that had at least one vendor match ≥80%, the grouped bars compare "
-                        "the current PT cost against the matched vendor's price. "
-                        "Ronix prices are FOB (pre-freight). Fewer / shorter bars = potential savings.</div>",
-                        unsafe_allow_html=True
-                    )
-                    df_chart = pd.DataFrame(chart_rows)
-                    vendor_colors = {
-                        "Performance Tools": "#2563eb",
-                        "CPL":          "#f59e0b",
-                        "Metabo":       "#10b981",
-                        "Ronix (FOB)":  "#ef4444",
-                    }
-                    fig = px.bar(
-                        df_chart,
-                        x="Item",
-                        y="Cost (USD)",
-                        color="Vendor",
-                        barmode="group",
-                        color_discrete_map=vendor_colors,
-                        text="Cost (USD)",
-                    )
-                    fig.update_traces(
-                        texttemplate="$%{text:.2f}",
-                        textposition="outside",
-                        marker_line_width=0,
-                    )
-                    fig.update_yaxes(tickprefix="$", tickformat=",.2f")
-                    fig.update_xaxes(tickangle=-30)
-                    _pd = plotly_defaults()
-                    _pd["legend"] = dict(
-                        orientation="h",
-                        yanchor="bottom", y=1.02,
-                        xanchor="right",  x=1,
-                        font=dict(color="#d4d0c8"),
-                    )
-                    fig.update_layout(**_pd, height=420)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No vendor matches ≥80% found for items in this category. Try a different category.")
-            else:
-                st.info(f"No items found in category '{selected_category}' with valid costs.")
-        else:
-            st.info("No categories available in Performance Tools data.")
+        # ── Cost comparison bar chart ────────────────────────────────────────
+        if chart_rows:
+            st.markdown("#### Cost Comparison — Performance Tools vs Matched Vendors")
+            df_chart = pd.DataFrame(chart_rows)
+            vendor_colors = {
+                "Performance Tools": "#2563eb",
+                "Workpro":           "#f59e0b",
+                "Metabo":            "#10b981",
+                "Ronix (FOB)":       "#ef4444",
+            }
+            fig = px.bar(df_chart, x="Item", y="Cost (USD)", color="Vendor",
+                         barmode="group", color_discrete_map=vendor_colors, text="Cost (USD)")
+            fig.update_traces(texttemplate="$%{text:.2f}", textposition="outside", marker_line_width=0)
+            fig.update_yaxes(tickprefix="$", tickformat=",.2f")
+            fig.update_xaxes(tickangle=-30)
+            _pd = plotly_defaults()
+            _pd["legend"] = dict(orientation="h", yanchor="bottom", y=1.02,
+                                 xanchor="right", x=1, font=dict(color="#d4d0c8"))
+            fig.update_layout(**_pd, height=420)
+            st.plotly_chart(fig, use_container_width=True)
 
 
 # ===========================================================================
@@ -1751,12 +1836,12 @@ def main():
         preds = build_predictions(data)
 
     dispatch = {
-        "Overview":             lambda: page_overview(data, scores),
-        "Scoring & Ranking":    lambda: page_scoring(data, scores),
+        "Overview":                lambda: page_overview(data, scores),
+        "Vendor Comparison":       lambda: page_vendor_comparison(data, scores),
+        "Scoring & Ranking":       lambda: page_scoring(data, scores),
         "Predictions & PO Timing": lambda: page_predictions(data, preds, scores),
-        "Price Analysis":       lambda: page_price_analysis(data, ronix_ff),
-        "Item Deep Dive":       lambda: page_item_deep_dive(data, scores, preds),
-        "Vendor Comparison":    lambda: page_vendor_comparison(data, scores),
+        "Price Analysis":          lambda: page_price_analysis(data, ronix_ff),
+        "Item Deep Dive":          lambda: page_item_deep_dive(data, scores, preds),
     }
     dispatch.get(page, dispatch["Overview"])()
 

@@ -35,7 +35,7 @@ VENDOR SUMMARY:
     Performance Tool  ->  Wilmar Corporation, Kent WA, USA   (CURRENT vendor)
     Metabo            ->  Metabowerke GmbH, Nurtingen, Germany (NEW)
     Ronix             ->  Ronix Tools, Iran  — FOB pricing    (NEW)
-    CPL              ->  CPL35, USA  — published price list    (NEW — file pending)
+    Workpro          ->  Workpro, China  — published price list  (NEW)
 
 INSTALL ONCE:
     pip install pandas openpyxl pdfplumber
@@ -60,8 +60,8 @@ PT_INTERNAL_FILE = BASE_DIR / "Performance_Tools.xlsx"
 PT_PO_SHEET      = "PO_transactions"
 PT_MASTER_SHEET  = "Perfomance tools MASTER TABLE "   # with trailing space
 
-# Performance Tool's published price catalogue (Wilmar / Performance Tool brand)
-# This is the SAME vendor as above — their external price list, not a different company
+# Workpro published price catalogue (China)
+# NEW vendor — price list only, not yet a current supplier
 PT_CATALOGUE_FILE  = BASE_DIR / "CPL35 Jan 02 2026 Price File.xlsx"
 PT_CATALOGUE_SHEET = "Data"       # full item detail with metadata
 PT_TIER_SHEET      = "Sheet1"     # CA35 / CA40 tiered pricing
@@ -187,26 +187,37 @@ def load_po_transactions():
 
     df["ITEMNO"] = df["ITEMNO"].astype(str).str.strip()
 
-    # --- Clean vendor_item_number: strip embedded text, keep item-number chars only ---
-    # Some rows have values like "W89012 Performance Tool" or "4500-A (see notes)"
-    # We extract the leading alphanumeric token (letters + digits + dash/dot/underscore)
-    # which is the actual vendor item number.
+    # --- Clean vendor_item_number: flag status values as empty ----------------
+    # Vendor item numbers that are status flags (NYA, No Longer Available,
+    # Obsolete, Discontinued, N/A etc.) are set to empty string so they are
+    # not used in fuzzy matching. Valid item numbers are kept as-is.
     if "vendor_item_number" in df.columns:
-        df["vendor_item_number"] = (
-            df["vendor_item_number"]
-            .astype(str)
-            .str.strip()
-            # Extract the first token that looks like an item number
-            # (starts with letter or digit, may contain - . _)
-            .str.extract(r"^([A-Za-z0-9][A-Za-z0-9\-\._]*)", expand=False)
-            .fillna("")
+        import re as _re
+        _VIN_STATUS = _re.compile(
+            r"^\s*(n/?a|no longer available|not available|nya|obsolete|"
+            r"discontinued|discont|unavailable|none|null|nan|"
+            r"replaced|delisted|phase.?out|tbd|pending|unknown)\s*$",
+            _re.IGNORECASE,
         )
-        # Log how many had embedded text removed
-        original_vals = df["vendor_item_number"].copy()
-        bad_mask = df["vendor_item_number"].ne(
-            df["vendor_item_number"].astype(str).str.strip()
+        _VIN_SUFFIX = _re.compile(
+            r"\s*[-–]\s*(discontinued|discont|n/?a|no longer|not available|"
+            r"nya|obsolete|replaced|phase.?out|unavail).*$",
+            _re.IGNORECASE,
         )
-        print(f"[INFO] vendor_item_number cleaned: {bad_mask.sum()} rows had embedded text stripped")
+        def _clean_vin(raw):
+            s = str(raw).strip()
+            if not s or s.lower() in ("nan", "none", ""):
+                return ""
+            if _VIN_STATUS.match(s):
+                return ""          # entire value is a status flag — discard
+            s = _VIN_SUFFIX.sub("", s).strip()   # strip trailing status text
+            return s
+
+        original = df["vendor_item_number"].copy()
+        df["vendor_item_number"] = df["vendor_item_number"].apply(_clean_vin)
+        flagged = (original.astype(str).str.strip() != "") & (df["vendor_item_number"] == "")
+        kept    = (df["vendor_item_number"] != "").sum()
+        print(f"[INFO] vendor_item_number: {kept} valid, {flagged.sum()} status flags cleared (NYA/Obsolete/etc.)")
 
     for dc in ["ORDDATE", "RECPDATE"]:
         if dc in df.columns:
@@ -293,7 +304,7 @@ def load_sage_master(po_df=None):
 # ===========================================================================
 # SECTION B — CPL PRICE CATALOGUE
 #             CPL35 Jan 02 2026 Price File.xlsx
-#             CPL35 published price list.
+#             Workpro published price list.
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -369,14 +380,14 @@ def load_pt_catalogue():
     df = df_data.merge(df_tier, on="item_number", how="left")
 
     # Tag clearly so there is no confusion downstream
-    df["vendor"]       = "CPL"
-    df["vendor_brand"] = "CPL35"
-    df["country"]      = "USA"
+    df["vendor"]       = "Workpro"
+    df["vendor_brand"] = "Workpro"
+    df["country"]      = "China"
     df["price_type"]   = "landed"
     df["source_file"]  = "CPL35 Jan 02 2026 Price File.xlsx"
 
     return save(df, "03_CPL_catalogue.csv",
-                "CPL catalogue (CPL35 Data + Sheet1 tiers)")
+                "Workpro catalogue (CPL35 file + Sheet1 tiers)")
 
 
 # ===========================================================================
@@ -528,7 +539,7 @@ def load_ronix():
 
     df["vendor"]       = "Ronix"
     df["vendor_brand"] = "Ronix Tools"
-    df["country"]      = "Iran"
+    df["country"]      = "China"
     df["price_type"]   = "fob"
     df["source_file"]  = "price list -new (1).pdf"
 
@@ -604,29 +615,37 @@ def build_combined(pt_df, metabo_df, ronix_df, usd_jpy_rate=None):
 
 
 # ===========================================================================
-# SECTION E — DUAL-PASS FUZZY ITEM-NUMBER MATCH  (vectorized, fast)
+# SECTION E — PT vs VENDOR MATCH  (Sage ITEMNO → each vendor separately)
 #
-# Uses rapidfuzz.process.cdist to score ALL queries vs ALL vendor keys in
-# one C-level call — 1,379 × 28,490 = ~39M comparisons finishes in seconds.
+# For each Sage item, each vendor is searched in strict priority order:
+#   Step 1 — Sage ITEMNO       vs vendor item_number       (keep >= 80%)
+#   Step 2 — Sage vendor_item_number vs vendor item_number  (keep >= 80%)
+#   Step 3 — Sage description  vs vendor description        (keep >= 55%)
 #
-# Pass 1: Sage ITEMNO           -> vendor item_number  (keep best >= 80%)
-# Pass 2: Sage vendor_item_number -> vendor item_number  (keep best >= 80%)
+# Steps run sequentially per Sage item per vendor — if Step 1 finds a
+# match the item is confirmed and Steps 2 & 3 are skipped for that vendor.
+# Each vendor is searched independently so there is no cross-contamination.
 #
-# Both passes run independently; a Sage item can appear in the output from
-# both passes (different vendor rows). Duplicate (ITEMNO, vendor_row) pairs
-# keep the higher score.
-#
-# Outputs:
-#   07_matched_vendor_prices.csv   — matched rows with match_score + match_pass
-#   07b_unmatched_sage_items.csv   — items with no >= 80% match on either pass
+# Output: 07_matched_vendor_prices.csv
+#   One row per (Sage item × vendor) confirmed match.
+#   Columns include: sage_ITEMNO, sage_description, sage_pt_cost,
+#                    vendor, item_number, item_description, vendor_price_usd,
+#                    match_score, match_step
 # ===========================================================================
-FUZZY_HIGH_THRESHOLD = 80
+PT_ITEMNO_THRESHOLD = 80   # item-number match floor (Steps 1 & 2)
+PT_DESC_THRESHOLD   = 55   # description match floor (Step 3 fallback)
 
 
-def build_fuzzy_matched(sage_df, combined_df, po_df):
-    """Vectorized dual-pass item-number fuzzy match using rapidfuzz cdist."""
-    if sage_df is None or combined_df is None:
-        print("[!!] Fuzzy match skipped — need Sage master and combined vendor file.")
+def build_fuzzy_matched(sage_df, po_df,
+                        workpro_df=None, metabo_df=None, ronix_df=None):
+    """
+    Match each Sage item against each vendor separately.
+    Step 1: Sage ITEMNO vs vendor item_number.
+    Step 2: Sage vendor_item_number vs vendor item_number.
+    Step 3: Sage description vs vendor description (fallback only).
+    """
+    if sage_df is None:
+        print("[!!] PT-vs-vendor match skipped — no Sage master.")
         return None
 
     try:
@@ -635,27 +654,42 @@ def build_fuzzy_matched(sage_df, combined_df, po_df):
         print("[!!] rapidfuzz not installed — run: pip install rapidfuzz")
         return None
 
-    print("[..] Preparing vendor item-number index …")
+    import numpy as np
 
-    # ── Build clean vendor key list (one entry per combined_df row) ─────────
-    # De-duplicate by item_number so we score unique keys once, then map back
-    vendor_items = combined_df.copy().reset_index(drop=True)
-    vendor_items["_key"] = vendor_items["item_number"].astype(str).str.strip().str.lower()
+    # ── Resolve vendor frames and their price columns ────────────────────────
+    vendor_frames = {}
+    if workpro_df is not None:
+        pcol = ("pt_cpl35_price"   if "pt_cpl35_price"   in workpro_df.columns else
+                "pt_current_price" if "pt_current_price" in workpro_df.columns else None)
+        if pcol:
+            vendor_frames["Workpro"] = (workpro_df.copy().reset_index(drop=True), pcol)
 
-    unique_keys   = vendor_items["_key"].tolist()   # length = N vendor rows
+    if metabo_df is not None and "vendor_price_usd" in metabo_df.columns:
+        vendor_frames["Metabo"] = (metabo_df.copy().reset_index(drop=True), "vendor_price_usd")
 
-    # ── Build Sage query lists ───────────────────────────────────────────────
+    if ronix_df is not None:
+        rcol = ("estimated_landed_price_usd"
+                if "estimated_landed_price_usd" in ronix_df.columns else
+                "fob_unit_price_usd"
+                if "fob_unit_price_usd"          in ronix_df.columns else None)
+        if rcol:
+            vendor_frames["Ronix"] = (ronix_df.copy().reset_index(drop=True), rcol)
+
+    if not vendor_frames:
+        print("[!!] PT-vs-vendor match skipped — no vendor dataframes.")
+        return None
+
+    # ── Sage side ────────────────────────────────────────────────────────────
     sage = sage_df.copy().reset_index(drop=True)
-    sage["_itemno"] = sage["ITEMNO"].astype(str).str.strip().str.lower()
+    sage["_ino"]  = sage["ITEMNO"].astype(str).str.strip().str.lower()
+    sage["_desc"] = sage["item_description"].fillna("").astype(str).str.strip().str.lower()
 
-    # vendor_item_number already baked into master by load_sage_master();
-    # fall back to PO sheet for anything missing
+    # vendor_item_number from master (baked in by load_sage_master) + PO fallback
     sage["_vin"] = sage.get("vendor_item_number", pd.Series("", index=sage.index))
     sage["_vin"] = sage["_vin"].fillna("").astype(str).str.strip().str.lower()
     sage["_vin"] = sage["_vin"].replace({"nan": "", "none": ""})
-
     if po_df is not None and "vendor_item_number" in po_df.columns:
-        po_clean = (
+        po_map = (
             po_df.dropna(subset=["ITEMNO", "vendor_item_number"])
             .assign(
                 _k=lambda d: d["ITEMNO"].astype(str).str.strip().str.lower(),
@@ -664,125 +698,337 @@ def build_fuzzy_matched(sage_df, combined_df, po_df):
             .groupby("_k")["_v"]
             .agg(lambda x: x.mode().iloc[0] if len(x.mode()) else "")
         )
-        missing_vin = sage["_vin"] == ""
-        sage.loc[missing_vin, "_vin"] = (
-            sage.loc[missing_vin, "_itemno"].map(po_clean).fillna("")
-        )
+        missing = sage["_vin"] == ""
+        sage.loc[missing, "_vin"] = sage.loc[missing, "_ino"].map(po_map).fillna("")
 
-    queries_p1 = sage["_itemno"].tolist()                  # Pass 1 queries
-    queries_p2 = sage["_vin"].tolist()                      # Pass 2 queries
+    all_matched = []
 
-    # ── Vectorized scoring via cdist ─────────────────────────────────────────
-    # cdist returns shape (n_queries, n_choices) score matrix, values 0-100
-    print(f"[..] Pass 1: scoring {len(queries_p1)} ITEMNO queries "
-          f"vs {len(unique_keys)} vendor keys …")
-    scores_p1 = rf_process.cdist(
-        queries_p1, unique_keys,
-        scorer=rf_fuzz.token_sort_ratio,
-        score_cutoff=0,
-        workers=-1,        # use all CPU cores
-    )   # shape: (1379, 28490)
+    # ── Match against each vendor independently ──────────────────────────────
+    for vendor_name, (vdf, price_col) in vendor_frames.items():
+        print(f"[..] PT vs {vendor_name}: {len(vdf):,} vendor items …")
 
-    # Only run pass 2 for rows that have a vendor_item_number
-    p2_mask = [bool(q) for q in queries_p2]
-    queries_p2_active = [q for q in queries_p2 if q]
-    p2_sage_idx       = [i for i, q in enumerate(queries_p2) if q]
+        # Vendor index
+        vdf["_vino"]  = vdf["item_number"].astype(str).str.strip().str.lower()
+        vdf["_vdesc"] = vdf["item_description"].astype(str).str.strip().str.lower()
+        vdf["_vprice"]= pd.to_numeric(vdf[price_col], errors="coerce")
 
-    if queries_p2_active:
-        print(f"[..] Pass 2: scoring {len(queries_p2_active)} vendor_item_number "
-              f"queries vs {len(unique_keys)} vendor keys …")
-        scores_p2_active = rf_process.cdist(
-            queries_p2_active, unique_keys,
+        vendor_inos  = vdf["_vino"].tolist()
+        vendor_descs = vdf["_vdesc"].tolist()
+
+        # ── Step 1: Sage ITEMNO vs vendor item_number ────────────────────────
+        sage_inos = sage["_ino"].tolist()
+        mat1 = rf_process.cdist(
+            sage_inos, vendor_inos,
             scorer=rf_fuzz.token_sort_ratio,
-            score_cutoff=0,
-            workers=-1,
-        )   # shape: (n_with_vin, 28490)
-    else:
-        scores_p2_active = None
+            score_cutoff=0, workers=-1,
+        )   # shape: (n_sage, n_vendor)
 
-    print("[..] Building match rows …")
+        # ── Step 2: Sage vendor_item_number vs vendor item_number ────────────
+        vin_queries = sage["_vin"].tolist()
+        active_vin  = [(i, q) for i, q in enumerate(vin_queries) if q]
+        mat2 = None
+        if active_vin:
+            mat2 = rf_process.cdist(
+                [q for _, q in active_vin], vendor_inos,
+                scorer=rf_fuzz.token_sort_ratio,
+                score_cutoff=0, workers=-1,
+            )
 
-    # ── Collect match rows ───────────────────────────────────────────────────
-    import numpy as np
-    matched_rows = []
-    seen         = {}    # (sage_ITEMNO_lower, vendor_idx) -> best_score
+        # ── Step 3: Sage description vs vendor description ───────────────────
+        sage_descs    = sage["_desc"].tolist()
+        active_descs  = [(i, d) for i, d in enumerate(sage_descs) if d]
+        mat3 = None
+        if active_descs:
+            mat3 = rf_process.cdist(
+                [d for _, d in active_descs], vendor_descs,
+                scorer=rf_fuzz.token_set_ratio,
+                score_cutoff=0, workers=-1,
+            )
 
-    def _emit(sage_row_idx, vendor_col_idx, score, pass_label):
-        sr   = sage.iloc[sage_row_idx]
-        ikey = str(sr["ITEMNO"]).strip().lower()
-        key  = (ikey, vendor_col_idx)
-        if score < FUZZY_HIGH_THRESHOLD or seen.get(key, 0) >= score:
-            return
-        seen[key] = score
-        vrow = vendor_items.iloc[vendor_col_idx].copy()
-        vrow["sage_ITEMNO"]      = sr["ITEMNO"]
-        vrow["match_score"]      = round(float(score), 1)
-        vrow["match_pass"]       = pass_label
-        vrow["sage_description"] = sr.get("item_description", "")
-        vrow["sage_pt_cost"]     = sr.get("performance_tool_price", None)
-        matched_rows.append(vrow)
+        # ── Build step-2 and step-3 score lookup (sage_idx -> best_vendor_idx, score) ──
+        step2_best = {}   # sage_idx -> (vendor_idx, score)
+        if mat2 is not None:
+            for pi, (si, _) in enumerate(active_vin):
+                best_col = int(np.argmax(mat2[pi]))
+                sc       = float(mat2[pi][best_col])
+                step2_best[si] = (best_col, sc)
 
-    # Pass 1 — best vendor col per Sage row
-    best_p1_cols   = scores_p1.argmax(axis=1)
-    best_p1_scores = scores_p1.max(axis=1)
-    for si in range(len(sage)):
-        sc = float(best_p1_scores[si])
-        if sc >= FUZZY_HIGH_THRESHOLD:
-            _emit(si, int(best_p1_cols[si]), sc, "pass1_itemno")
+        step3_best = {}   # sage_idx -> (vendor_idx, score)
+        if mat3 is not None:
+            for pi, (si, _) in enumerate(active_descs):
+                best_col = int(np.argmax(mat3[pi]))
+                sc       = float(mat3[pi][best_col])
+                step3_best[si] = (best_col, sc)
 
-    # Pass 2 — best vendor col for rows that had a vendor_item_number
-    if scores_p2_active is not None:
-        best_p2_cols   = scores_p2_active.argmax(axis=1)
-        best_p2_scores = scores_p2_active.max(axis=1)
-        for pi, si in enumerate(p2_sage_idx):
-            sc = float(best_p2_scores[pi])
-            if sc >= FUZZY_HIGH_THRESHOLD:
-                _emit(si, int(best_p2_cols[pi]), sc, "pass2_vendor_itemno")
+        # ── For each Sage item: step 1 → step 2 → step 3 ────────────────────
+        vendor_matched = 0
+        for si in range(len(sage)):
+            sr = sage.iloc[si]
 
-    # ── Unmatched ────────────────────────────────────────────────────────────
-    matched_sage_lower = {k[0] for k in seen}
-    unmatched_rows = []
-    for si in range(len(sage)):
-        sr   = sage.iloc[si]
-        ikey = str(sr["ITEMNO"]).strip().lower()
-        if ikey not in matched_sage_lower:
-            unmatched_rows.append({
-                "sage_ITEMNO":           sr["ITEMNO"],
-                "sage_description":      sr.get("item_description", ""),
-                "pass1_best_score":      round(float(best_p1_scores[si]), 1),
-                "pass2_vendor_ino_used": sage.iloc[si]["_vin"],
-                "pass2_best_score":      round(
-                    float(best_p2_scores[p2_sage_idx.index(si)])
-                    if si in p2_sage_idx and scores_p2_active is not None else 0, 1
-                ),
+            # Step 1 — Sage ITEMNO
+            best1_col = int(np.argmax(mat1[si]))
+            sc1       = float(mat1[si][best1_col])
+            if sc1 >= PT_ITEMNO_THRESHOLD:
+                vi = best1_col
+                step = "step1_itemno"
+                sc   = sc1
+            else:
+                # Step 2 — Sage vendor_item_number
+                vi2, sc2 = step2_best.get(si, (-1, 0.0))
+                if sc2 >= PT_ITEMNO_THRESHOLD and vi2 >= 0:
+                    vi   = vi2
+                    step = "step2_vendor_itemno"
+                    sc   = sc2
+                else:
+                    # Step 3 — description fallback
+                    vi3, sc3 = step3_best.get(si, (-1, 0.0))
+                    if sc3 >= PT_DESC_THRESHOLD and vi3 >= 0:
+                        vi   = vi3
+                        step = "step3_description"
+                        sc   = sc3
+                    else:
+                        continue   # no match for this Sage item / vendor pair
+
+            vrow = vdf.iloc[vi]
+            vp   = float(vrow["_vprice"]) if pd.notna(vrow["_vprice"]) else None
+            all_matched.append({
+                "sage_ITEMNO":      sr["ITEMNO"],
+                "sage_description": sr.get("item_description", ""),
+                "sage_pt_cost":     sr.get("performance_tool_price", None),
+                "vendor":           vendor_name,
+                "item_number":      vrow["item_number"],
+                "item_description": vrow["item_description"],
+                "vendor_price_usd": vp,
+                "match_score":      round(sc, 1),
+                "match_step":       step,
             })
+            vendor_matched += 1
 
-    # ── Save ─────────────────────────────────────────────────────────────────
-    if matched_rows:
-        df_matched = (
-            pd.DataFrame(matched_rows)
-            .drop(columns=["_key", "_itemno", "_vin"], errors="ignore")
-            .reset_index(drop=True)
+        print(f"[INFO]   {vendor_name}: {vendor_matched} Sage items matched")
+
+    if not all_matched:
+        print("[!!] No PT-vs-vendor matches found.")
+        return None
+
+    df_matched = pd.DataFrame(all_matched).reset_index(drop=True)
+    save(df_matched, "07_matched_vendor_prices.csv",
+         "PT-vs-vendor matches (step1=itemno, step2=vendor_ino, step3=desc)")
+
+    # Unmatched — Sage items with no match in ANY vendor
+    matched_inos = set(df_matched["sage_ITEMNO"].astype(str).str.strip())
+    unmatched = sage[~sage["ITEMNO"].astype(str).str.strip().isin(matched_inos)]
+    if len(unmatched):
+        save(
+            unmatched[["ITEMNO", "item_description"]].rename(
+                columns={"ITEMNO": "sage_ITEMNO", "item_description": "sage_description"}
+            ),
+            "07b_unmatched_sage_items.csv",
+            "Sage items with no vendor match across all vendors"
         )
-        save(df_matched, "07_matched_vendor_prices.csv",
-             "Dual-pass fuzzy matched vendor prices (>=80%)")
-    else:
-        df_matched = None
-        print("[!!] No matches found — check item number overlap between files.")
-
-    if unmatched_rows:
-        save(pd.DataFrame(unmatched_rows), "07b_unmatched_sage_items.csv",
-             "Sage items with no vendor match on either pass")
 
     total   = len(sage)
-    matched = len(matched_sage_lower)
-    p1_n    = sum(1 for r in matched_rows if "pass1" in str(r.get("match_pass", "")))
-    p2_n    = sum(1 for r in matched_rows if "pass2" in str(r.get("match_pass", "")))
-    print(f"[INFO] Matched {matched}/{total} unique Sage items ({100*matched/total:.1f}%)")
-    print(f"[INFO] Total match rows: {len(matched_rows)}  "
-          f"(pass1={p1_n}, pass2={p2_n})")
+    matched = len(matched_inos)
+    print(f"[INFO] Total: {matched}/{total} Sage items matched in at least one vendor "
+          f"({100*matched/total:.1f}%)")
+    print(f"[INFO] Total rows: {len(df_matched)} "
+          f"(step1={sum(1 for r in all_matched if r['match_step']=='step1_itemno')}, "
+          f"step2={sum(1 for r in all_matched if r['match_step']=='step2_vendor_itemno')}, "
+          f"step3={sum(1 for r in all_matched if r['match_step']=='step3_description')})")
 
-    return df_matched if matched_rows else None
+    return df_matched
+
+
+
+# ===========================================================================
+# SECTION F — VENDOR vs VENDOR MATCH  (Workpro / Metabo / Ronix pairwise)
+#
+# For each vendor pair, items are matched in two steps then validated:
+#   Step 1 — item_number vs item_number  (keep >= 80%)
+#   Step 2 — description vs description  (keep >= 55%, only for items that
+#             did NOT get a Step 1 match)
+#   Step 3 — LOW-SCORE item_number matches (60–79%) are re-checked against
+#             description: if description >= 50% the match is kept and
+#             tagged "itemno_desc_confirmed"; otherwise discarded
+#
+# Output: 08_cross_vendor_matches.csv
+# ===========================================================================
+CV_ITEMNO_HIGH    = 80   # item-number floor — confirmed without extra check
+CV_ITEMNO_LOW     = 60   # item-number "maybe" range — needs description check
+CV_DESC_THRESHOLD = 55   # description-only match floor (Step 2)
+CV_DESC_CONFIRM   = 50   # description score needed to promote low itemno match
+
+
+def _strip_status_cv(raw: str) -> str:
+    """Strip status suffixes from vendor item_number."""
+    import re as _re
+    _STATUS = _re.compile(
+        r"\s*[-–—]\s*(discontinued|discont|disc|n/?a|no longer|not available|"
+        r"nya|obsolete|delisted|replaced|phase.?out|unavail)[^$]*$",
+        _re.IGNORECASE,
+    )
+    _NA_ONLY = _re.compile(
+        r"^\s*(n/?a|no longer available|not available|nya|obsolete|discontinued|"
+        r"unavailable|none|null|nan)\s*$",
+        _re.IGNORECASE,
+    )
+    s = str(raw).strip()
+    if _NA_ONLY.match(s):
+        return ""
+    s = _STATUS.sub("", s).strip()
+    import re
+    m = re.match(r"([A-Za-z0-9][A-Za-z0-9\-\._]*)", s)
+    return m.group(1).lower() if m else ""
+
+
+def build_cross_vendor_matches(workpro_df, metabo_df, ronix_df):
+    """
+    Match vendors against each other pairwise.
+    Step 1: item_number → item_number (>=80% keep, 60-79% check desc).
+    Step 2: description → description for items with no item_number match.
+    Step 3: 60-79% item_number matches boosted by description confirmation.
+    """
+    try:
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+    except ImportError:
+        print("[!!] rapidfuzz not installed — cross-vendor match skipped.")
+        return None
+
+    import numpy as np
+
+    def _prep(df, vendor_name, price_col):
+        if df is None or df.empty:
+            return None
+        out = df[["item_number", "item_description"]].copy().reset_index(drop=True)
+        out["vendor"]   = vendor_name
+        out["price"]    = pd.to_numeric(df[price_col], errors="coerce")
+        out["_ino"]     = out["item_number"].astype(str).str.strip().str.lower()
+        out["_ino_cl"]  = out["_ino"].apply(_strip_status_cv)
+        out["_desc"]    = out["item_description"].astype(str).str.strip().str.lower()
+        return out
+
+    # Resolve vendor frames
+    frames = {}
+    if workpro_df is not None:
+        pcol = ("pt_cpl35_price"   if "pt_cpl35_price"   in workpro_df.columns else
+                "pt_current_price" if "pt_current_price" in workpro_df.columns else None)
+        if pcol:
+            frames["Workpro"] = _prep(workpro_df, "Workpro", pcol)
+
+    if metabo_df is not None and "vendor_price_usd" in metabo_df.columns:
+        frames["Metabo"] = _prep(metabo_df, "Metabo", "vendor_price_usd")
+
+    if ronix_df is not None:
+        rcol = ("estimated_landed_price_usd"
+                if "estimated_landed_price_usd" in ronix_df.columns else
+                "fob_unit_price_usd"
+                if "fob_unit_price_usd"          in ronix_df.columns else None)
+        if rcol:
+            frames["Ronix"] = _prep(ronix_df, "Ronix", rcol)
+
+    if len(frames) < 2:
+        print("[!!] Need at least 2 vendors for cross-vendor matching.")
+        return None
+
+    vendor_names = list(frames.keys())
+    pairs = [(vendor_names[i], vendor_names[j])
+             for i in range(len(vendor_names))
+             for j in range(i + 1, len(vendor_names))]
+
+    all_matches = []
+    seen_pairs  = set()
+
+    def _emit(row_a, row_b, va, vb, score, method):
+        key = (va, row_a["_ino"], vb, row_b["_ino"])
+        rev = (vb, row_b["_ino"], va, row_a["_ino"])
+        if key in seen_pairs or rev in seen_pairs:
+            return
+        seen_pairs.add(key)
+        pa = row_a["price"]
+        pb = row_b["price"]
+        all_matches.append({
+            "vendor_a":         va,
+            "item_number_a":    row_a["item_number"],
+            "description_a":    row_a["item_description"],
+            "price_a_usd":      round(float(pa), 2) if pd.notna(pa) else None,
+            "vendor_b":         vb,
+            "item_number_b":    row_b["item_number"],
+            "description_b":    row_b["item_description"],
+            "price_b_usd":      round(float(pb), 2) if pd.notna(pb) else None,
+            "item_match_score": round(score, 1),
+            "match_method":     method,
+        })
+
+    for va, vb in pairs:
+        fa = frames[va]
+        fb = frames[vb]
+        print(f"[..] Cross-matching {va} ({len(fa):,}) vs {vb} ({len(fb):,}) …")
+
+        inos_a  = fa["_ino"].tolist()
+        inos_b  = fb["_ino"].tolist()
+        descs_a = fa["_desc"].tolist()
+        descs_b = fb["_desc"].tolist()
+
+        # ── Step 1: item_number A vs item_number B ───────────────────────────
+        mat_ino = rf_process.cdist(
+            inos_a, inos_b,
+            scorer=rf_fuzz.token_sort_ratio,
+            score_cutoff=0, workers=-1,
+        )
+
+        # ── Step 2 / 3: description A vs description B ───────────────────────
+        mat_desc = rf_process.cdist(
+            descs_a, descs_b,
+            scorer=rf_fuzz.token_set_ratio,
+            score_cutoff=0, workers=-1,
+        )
+
+        step1_confirmed = set()   # row indices in fa that got a Step 1 match
+        low_score_rows  = []      # (ia, ib, sc_ino) for 60-79% item_number hits
+
+        for ia in range(len(fa)):
+            best_ib  = int(np.argmax(mat_ino[ia]))
+            sc_ino   = float(mat_ino[ia][best_ib])
+
+            if sc_ino >= CV_ITEMNO_HIGH:
+                # High-confidence item_number match — keep directly
+                _emit(fa.iloc[ia], fb.iloc[best_ib], va, vb, sc_ino, "itemno")
+                step1_confirmed.add(ia)
+
+            elif sc_ino >= CV_ITEMNO_LOW:
+                # Low-confidence item_number match — queue for Step 3 desc check
+                low_score_rows.append((ia, best_ib, sc_ino))
+
+        # ── Step 2: description match for unmatched rows ─────────────────────
+        for ia in range(len(fa)):
+            if ia in step1_confirmed:
+                continue   # already matched by item_number
+            best_ib  = int(np.argmax(mat_desc[ia]))
+            sc_desc  = float(mat_desc[ia][best_ib])
+            if sc_desc >= CV_DESC_THRESHOLD:
+                _emit(fa.iloc[ia], fb.iloc[best_ib], va, vb, sc_desc, "description")
+
+        # ── Step 3: re-check low item_number scores with description ─────────
+        for ia, ib, sc_ino in low_score_rows:
+            sc_desc = float(mat_desc[ia][ib])   # desc score for the SAME pair
+            if sc_desc >= CV_DESC_CONFIRM:
+                # Both item_number and description agree — promote
+                _emit(fa.iloc[ia], fb.iloc[ib], va, vb,
+                      (sc_ino + sc_desc) / 2, "itemno_desc_confirmed")
+
+        n_pair = sum(1 for m in all_matches
+                     if m["vendor_a"] in (va, vb) and m["vendor_b"] in (va, vb))
+        print(f"[INFO]   {va} <-> {vb}: {n_pair} matched pairs")
+
+    if not all_matches:
+        print("[!!] No cross-vendor matches found.")
+        return None
+
+    df_cross = pd.DataFrame(all_matches).reset_index(drop=True)
+    save(df_cross, "08_cross_vendor_matches.csv",
+         "Cross-vendor matches (Workpro / Metabo / Ronix pairwise)")
+    print(f"[INFO] Total cross-vendor pairs: {len(df_cross)}")
+    return df_cross
+
 
 
 # ===========================================================================
@@ -797,8 +1043,8 @@ def main():
 VENDOR MAP:
   Performance Tool  (CURRENT)  Wilmar Corp, Kent WA, USA
     Internal data  <- Performance_Tools.xlsx  (both sheets)
-  CPL  (NEW)                   CPL35, USA
-    Price list     <- CPL35 Jan 02 2026 Price File.xlsx
+  Workpro  (NEW)               Workpro, China
+    Price list     <- CPL35 Jan 02 2026 Price File.xlsx  (Workpro catalogue)
   Metabo  (NEW)               Metabowerke GmbH, Germany
     Price list     <- 251030 Lista precios METABO -JMC.xlsx
   Ronix  (NEW)                Ronix Tools, Iran  [FOB pricing]
@@ -826,10 +1072,22 @@ VENDOR MAP:
     print("\n--- D: Building combined vendor price file ---")
     combined_df = build_combined(pt_df, metabo_df, ronix_df, usd_jpy_rate)
 
-    print("\n--- E: Dual-pass item-number fuzzy match ---")
-    print("    Pass 1: Sage ITEMNO           -> vendor item_number  (keep >= 80%)")
-    print("    Pass 2: Sage vendor_item_number -> vendor item_number  (keep >= 80%)")
-    _matched_df = build_fuzzy_matched(master_df, combined_df, po_df)
+    print("\n--- E: PT vs Vendor match (Sage -> each vendor separately) ---")
+    print("    Step 1: Sage ITEMNO          -> vendor item_number  (>= 80%)")
+    print("    Step 2: Sage vendor_item_no  -> vendor item_number  (>= 80%)")
+    print("    Step 3: Sage description     -> vendor description   (>= 55%, fallback)")
+    _matched_df = build_fuzzy_matched(
+        master_df, po_df,
+        workpro_df=pt_df,
+        metabo_df=metabo_df,
+        ronix_df=ronix_df,
+    )
+
+    print("\n--- F: Vendor vs Vendor match (Workpro / Metabo / Ronix pairwise) ---")
+    print("    Step 1: item_number vs item_number  (>= 80% keep, 60-79% check desc)")
+    print("    Step 2: description vs description   (>= 55%, for unmatched items)")
+    print("    Step 3: low item_number (60-79%) + description >= 50% = confirmed")
+    _cross_df = build_cross_vendor_matches(pt_df, metabo_df, ronix_df)
 
     print("\n" + "=" * 65)
     print("  INGESTION COMPLETE")
