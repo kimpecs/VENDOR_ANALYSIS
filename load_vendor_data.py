@@ -10,9 +10,15 @@ SOURCE FILES (all sit in the same VENDORANAYLSIS folder as this script):
       Sheet 1 : "PO_transactions"              <- PO history, lead times
       Sheet 2 : "Perfomance tools MASTER TABLE" <- Sage sales data (your SQL output)
 
+  workpro.xlsx
+      *** This is Workpro's published FOB price catalogue (China) ***
+      *** NEW vendor being assessed — NOT the current supplier ***
+      Sheet "Workpro" : full item list with item numbers, descriptions,
+                        package info, qty per carton, and 2026 FOB prices
+
   CPL35 Jan 02 2026 Price File.xlsx
-      *** This is Performance Tool's OWN published price catalogue ***
-      *** (Wilmar Corporation / Performance Tool brand) — NOT a separate vendor ***
+      *** Performance Tool's OWN published price catalogue ***
+      *** (Wilmar Corporation / Performance Tool brand) — CURRENT vendor ***
       Sheet "Data"   : full item list with metadata + list prices
       Sheet "Sheet1" : tiered pricing columns CA35 / CA40
 
@@ -26,7 +32,7 @@ OUTPUT  ->  VENDORANAYLSIS/processed/
     01_po_transactions.csv              Performance Tool PO history
     01b_po_lead_time_summary.csv        Avg/min/max lead time per item
     02_sage_master.csv                  Your internal sales data (from Sage)
-    03_performance_tool_catalogue.csv   CPL35 Data sheet + Sheet1 tier prices MERGED
+    03b_workpro_prices.csv              Workpro FOB price list
     04_metabo_prices.csv                Metabo price list
     05_ronix_prices.csv                 Ronix FOB prices + estimated landed cost
     06_combined_vendor_prices.csv       All 3 vendor price lists unified (for fuzzy match)
@@ -60,11 +66,9 @@ PT_INTERNAL_FILE = BASE_DIR / "Performance_Tools.xlsx"
 PT_PO_SHEET      = "PO_transactions"
 PT_MASTER_SHEET  = "Perfomance tools MASTER TABLE "   # with trailing space
 
-# Workpro published price catalogue (China)
-# NEW vendor — price list only, not yet a current supplier
-PT_CATALOGUE_FILE  = BASE_DIR / "CPL35 Jan 02 2026 Price File.xlsx"
-PT_CATALOGUE_SHEET = "Data"       # full item detail with metadata
-PT_TIER_SHEET      = "Sheet1"     # CA35 / CA40 tiered pricing
+# Workpro published price catalogue (China -- NEW vendor)
+WORKPRO_FILE  = BASE_DIR / "workpro.xlsx"
+WORKPRO_SHEET = "Workpro"
 
 # New vendors
 METABO_FILE  = BASE_DIR / "251030 Lista precios METABO -JMC.xlsx"
@@ -302,92 +306,50 @@ def load_sage_master(po_df=None):
 
 
 # ===========================================================================
-# SECTION B — CPL PRICE CATALOGUE
-#             CPL35 Jan 02 2026 Price File.xlsx
-#             Workpro published price list.
 # ===========================================================================
-
-# ---------------------------------------------------------------------------
-# B1.  CPL35 DATA SHEET  — full item catalogue with metadata
+# SECTION B -- WORKPRO PRICE CATALOGUE
+#               workpro.xlsx  ->  sheet: Workpro
+#               Workpro, China -- NEW vendor being assessed
 #
-# Columns: Item | Description | Current price | CPL35 (1.1.26) | Change % |
-#          Standard Pack | Inner Qty | Master Qty | UPC | Class | Class Desc |
-#          Brand | Brand Desc | Subclass | Subclass Desc | Group | New
-# ---------------------------------------------------------------------------
-def load_pt_catalogue():
-    if not check(PT_CATALOGUE_FILE):
+# Columns: Item No. | Type | Product Name | Description & Features |
+#          Package | Quantity per Outer Carton | 2026 General Price FOB (USD)
+# ===========================================================================
+def load_workpro():
+    if not check(WORKPRO_FILE):
         return None
 
-    # --- Data sheet ---
-    df_data = pd.read_excel(
-        PT_CATALOGUE_FILE,
-        sheet_name=PT_CATALOGUE_SHEET,
-        dtype={"Item": str}
+    df = pd.read_excel(
+        WORKPRO_FILE,
+        sheet_name=WORKPRO_SHEET,
+        dtype={"Item No.": str}
     )
-    df_data.columns = df_data.columns.str.strip()
+    df.columns = df.columns.str.strip()
+    df.dropna(how="all", inplace=True)
 
-    df_data.rename(columns={
-        "Item":            "item_number",
-        "Description":     "item_description",
-        "Current price":   "pt_current_price",
-        "CPL35 Current":   "pt_current_price",
-        "CPL35 (1.1.26)":  "pt_cpl35_price",
-        "CPL35 1.1.26":    "pt_cpl35_price",
-        "CPL35 1.1.26 ":   "pt_cpl35_price",
-        "Change %":        "pt_price_change_pct",
-        "Change":          "pt_price_change_pct",
-        "Standard Pack":   "standard_pack",
-        "Inner Qty":       "inner_qty",
-        "Master Qty":      "master_qty",
-        "UPC":             "upc",
-        "Class":           "class_code",
-        "Class Desc":      "class_desc",
-        "Brand":           "brand_code",
-        "Brand Desc":      "brand_desc",
-        "Subclass":        "subclass_code",
-        "Subclass Desc":   "subclass_desc",
-        "Group":           "group_name",
-        "New":             "is_new_item",
+    df.rename(columns={
+        "Item No.":                     "item_number",
+        "Product Name":                 "item_description",
+        "Description & Features":       "product_description",
+        "2026 General Price FOB (USD)": "vendor_price_usd",
+        "Package":                      "standard_pack",
+        "Quantity per Outer Carton":    "qty_per_carton",
+        "Type":                         "group_name",
     }, inplace=True)
 
-    df_data["item_number"] = df_data["item_number"].astype(str).str.strip()
-    df_data.dropna(subset=["item_number"], inplace=True)
+    df["item_number"] = df["item_number"].astype(str).str.strip()
+    df.dropna(subset=["item_number"], inplace=True)
+    df = df[df["item_number"].str.strip() != ""].copy()
 
-    for col in ["pt_current_price", "pt_cpl35_price", "pt_price_change_pct"]:
-        if col in df_data.columns:
-            df_data[col] = clean_price_col(df_data[col])
+    if "vendor_price_usd" in df.columns:
+        df["vendor_price_usd"] = clean_price_col(df["vendor_price_usd"])
 
-    # --- Sheet1: tier pricing  (Item | CA35 | CA40) ---
-    df_tier = pd.read_excel(
-        PT_CATALOGUE_FILE,
-        sheet_name=PT_TIER_SHEET,
-        dtype={"Item": str}
-    )
-    df_tier.columns = df_tier.columns.str.strip()
-
-    df_tier.rename(columns={
-        "Item":  "item_number",
-        "CA35":  "pt_price_ca35",
-        "CA40":  "pt_price_ca40",
-    }, inplace=True)
-    df_tier["item_number"] = df_tier["item_number"].astype(str).str.strip()
-
-    for col in ["pt_price_ca35", "pt_price_ca40"]:
-        if col in df_tier.columns:
-            df_tier[col] = clean_price_col(df_tier[col])
-
-    # Merge data sheet + tier pricing on item_number
-    df = df_data.merge(df_tier, on="item_number", how="left")
-
-    # Tag clearly so there is no confusion downstream
     df["vendor"]       = "Workpro"
     df["vendor_brand"] = "Workpro"
     df["country"]      = "China"
-    df["price_type"]   = "landed"
-    df["source_file"]  = "CPL35 Jan 02 2026 Price File.xlsx"
+    df["price_type"]   = "fob"
+    df["source_file"]  = "workpro.xlsx"
 
-    return save(df, "03_CPL_catalogue.csv",
-                "Workpro catalogue (CPL35 file + Sheet1 tiers)")
+    return save(df, "03b_workpro_prices.csv", "Workpro catalogue (FOB price list)")
 
 
 # ===========================================================================
@@ -551,22 +513,13 @@ def load_ronix():
 # Stacks Performance Tool, Metabo and Ronix into one file.
 # This is what the fuzzy matching script will join against your Sage master.
 # ===========================================================================
-def build_combined(pt_df, metabo_df, ronix_df, usd_jpy_rate=None):
+def build_combined(workpro_df, metabo_df, ronix_df, usd_jpy_rate=None):
 
     frames = []
 
-    if pt_df is not None:
-        slim = pt_df[["item_number", "item_description",
-                       "vendor", "vendor_brand", "country", "price_type"]].copy()
-        # Use the new CPL35 price as the primary cost; fall back to current price
-        if "pt_cpl35_price" in pt_df.columns:
-            slim["vendor_price_usd"] = pt_df["pt_cpl35_price"].values
-        elif "pt_current_price" in pt_df.columns:
-            slim["vendor_price_usd"] = pt_df["pt_current_price"].values
-        # Keep tier prices for reference
-        for tier in ["pt_price_ca35", "pt_price_ca40"]:
-            if tier in pt_df.columns:
-                slim[tier] = pt_df[tier].values
+    if workpro_df is not None:
+        slim = workpro_df[["item_number", "item_description", "vendor_price_usd",
+                            "vendor", "vendor_brand", "country", "price_type"]].copy()
         frames.append(slim)
 
     if metabo_df is not None:
@@ -656,13 +609,10 @@ def build_fuzzy_matched(sage_df, po_df,
 
     import numpy as np
 
-    # ── Resolve vendor frames and their price columns ────────────────────────
+    # ── Resolve vendor frames and their price columns ────────────────────
     vendor_frames = {}
-    if workpro_df is not None:
-        pcol = ("pt_cpl35_price"   if "pt_cpl35_price"   in workpro_df.columns else
-                "pt_current_price" if "pt_current_price" in workpro_df.columns else None)
-        if pcol:
-            vendor_frames["Workpro"] = (workpro_df.copy().reset_index(drop=True), pcol)
+    if workpro_df is not None and "vendor_price_usd" in workpro_df.columns:
+        vendor_frames["Workpro"] = (workpro_df.copy().reset_index(drop=True), "vendor_price_usd")
 
     if metabo_df is not None and "vendor_price_usd" in metabo_df.columns:
         vendor_frames["Metabo"] = (metabo_df.copy().reset_index(drop=True), "vendor_price_usd")
@@ -908,11 +858,8 @@ def build_cross_vendor_matches(workpro_df, metabo_df, ronix_df):
 
     # Resolve vendor frames
     frames = {}
-    if workpro_df is not None:
-        pcol = ("pt_cpl35_price"   if "pt_cpl35_price"   in workpro_df.columns else
-                "pt_current_price" if "pt_current_price" in workpro_df.columns else None)
-        if pcol:
-            frames["Workpro"] = _prep(workpro_df, "Workpro", pcol)
+    if workpro_df is not None and "vendor_price_usd" in workpro_df.columns:
+        frames["Workpro"] = _prep(workpro_df, "Workpro", "vendor_price_usd")
 
     if metabo_df is not None and "vendor_price_usd" in metabo_df.columns:
         frames["Metabo"] = _prep(metabo_df, "Metabo", "vendor_price_usd")
@@ -1042,9 +989,9 @@ def main():
     print("""
 VENDOR MAP:
   Performance Tool  (CURRENT)  Wilmar Corp, Kent WA, USA
-    Internal data  <- Performance_Tools.xlsx  (both sheets)
+    Internal data  <- Performance_Tools.xlsx  (PO_transactions + Sage master)
   Workpro  (NEW)               Workpro, China
-    Price list     <- CPL35 Jan 02 2026 Price File.xlsx  (Workpro catalogue)
+    Price list     <- workpro.xlsx  (FOB catalogue)
   Metabo  (NEW)               Metabowerke GmbH, Germany
     Price list     <- 251030 Lista precios METABO -JMC.xlsx
   Ronix  (NEW)                Ronix Tools, Iran  [FOB pricing]
@@ -1060,8 +1007,8 @@ VENDOR MAP:
     po_df     = load_po_transactions()
     master_df = load_sage_master(po_df=po_df)
 
-    print("\n--- B: CPL catalogue (CPL35 Jan 02 2026 Price File.xlsx) ---")
-    pt_df     = load_pt_catalogue()
+    print("\n--- B: Workpro prices (workpro.xlsx) ---")
+    workpro_df = load_workpro()
 
     print("\n--- C1: Metabo prices ---")
     metabo_df = load_metabo()
@@ -1070,7 +1017,7 @@ VENDOR MAP:
     ronix_df  = load_ronix()
 
     print("\n--- D: Building combined vendor price file ---")
-    combined_df = build_combined(pt_df, metabo_df, ronix_df, usd_jpy_rate)
+    combined_df = build_combined(workpro_df, metabo_df, ronix_df, usd_jpy_rate)
 
     print("\n--- E: PT vs Vendor match (Sage -> each vendor separately) ---")
     print("    Step 1: Sage ITEMNO          -> vendor item_number  (>= 80%)")
@@ -1078,16 +1025,16 @@ VENDOR MAP:
     print("    Step 3: Sage description     -> vendor description   (>= 55%, fallback)")
     _matched_df = build_fuzzy_matched(
         master_df, po_df,
-        workpro_df=pt_df,
+        workpro_df=workpro_df,
         metabo_df=metabo_df,
         ronix_df=ronix_df,
     )
 
-    print("\n--- F: Vendor vs Vendor match (Workpro / Metabo / Ronix pairwise) ---")
+    print("\n--- F: Vendor vs Vendor match (PT / Workpro / Metabo / Ronix pairwise) ---")
     print("    Step 1: item_number vs item_number  (>= 80% keep, 60-79% check desc)")
     print("    Step 2: description vs description   (>= 55%, for unmatched items)")
     print("    Step 3: low item_number (60-79%) + description >= 50% = confirmed")
-    _cross_df = build_cross_vendor_matches(pt_df, metabo_df, ronix_df)
+    _cross_df = build_cross_vendor_matches(workpro_df, metabo_df, ronix_df)
 
     print("\n" + "=" * 65)
     print("  INGESTION COMPLETE")
