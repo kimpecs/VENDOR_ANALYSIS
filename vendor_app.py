@@ -138,6 +138,25 @@ YEARS    = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 # Used for ETA calculation — update if your actual average differs
 DEFAULT_PT_LEAD_DAYS = 90
 
+# ---------------------------------------------------------------------------
+# BOJ EXCHANGE RATE HELPER
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_boj_rate():
+    """Most recent USD->JMD rate from Search BOJ Counter Rates.csv (DMD & TT column)."""
+    boj_file = Path(__file__).parent / "Search BOJ Counter Rates.csv"
+    if not boj_file.exists():
+        return None
+    try:
+        df = pd.read_csv(boj_file)
+        df.columns = df.columns.str.strip()
+        df["Date"] = pd.to_datetime(df["Date"], format="%d %b %Y", errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date")
+        rate = pd.to_numeric(df.iloc[-1]["DMD & TT"], errors="coerce")
+        return float(rate) if pd.notna(rate) and rate > 0 else None
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # DATA LOADERS
@@ -176,7 +195,7 @@ def load_data():
 
 
 @st.cache_data(show_spinner=False)
-def build_vendor_match_table(_data, category_filter="— All —"):
+def build_vendor_match_table(_data, category_filter="— All —", boj_rate=None):
     """
     Build the vendor match table from pre-computed 07_matched_vendor_prices.csv.
     Fast — just filters and pivots. No live fuzzy matching.
@@ -245,10 +264,12 @@ def build_vendor_match_table(_data, category_filter="— All —"):
 
         item_matches = df[df["sage_ITEMNO"].astype(str).str.strip() == ino]
 
+        pt_cost_jmd = (pt_cost * boj_rate) if (pt_cost and boj_rate) else None
         row = {
-            "ITEMNO":         ino,
-            "PT Description": pt_desc,
-            "PT Cost (USD)":  f"${pt_cost:.2f}" if pt_cost else "—",
+            "Item No.":      ino,
+            "Description":   pt_desc,
+            "Cost (USD)":    f"${pt_cost:.2f}" if pt_cost else "—",
+            "Cost (JMD)":    f"J${pt_cost_jmd:,.0f}" if pt_cost_jmd else "—",
         }
 
         lbl = (pt_desc[:35] + "…") if len(pt_desc) > 35 else pt_desc
@@ -257,23 +278,27 @@ def build_vendor_match_table(_data, category_filter="— All —"):
         for v in ["Workpro", "Metabo", "Ronix"]:
             vm = item_matches[item_matches["vendor"] == v]
             if not vm.empty:
-                best = vm.sort_values("match_score", ascending=False).iloc[0]
-                vp   = pd.to_numeric(best.get("vendor_price_usd", None), errors="coerce")
-                row[f"{v} Match"]      = str(best.get("item_description", "—"))[:60]
-                row[f"{v} Cost (USD)"] = f"${vp:.2f}" if pd.notna(vp) and vp > 0 else "—"
-                row[f"{v} Match %"]    = f"{float(best.get('match_score', 0)):.0f}%"
+                best    = vm.sort_values("match_score", ascending=False).iloc[0]
+                vp      = pd.to_numeric(best.get("vendor_price_usd", None), errors="coerce")
+                vp_jmd  = (float(vp) * boj_rate) if (pd.notna(vp) and vp > 0 and boj_rate) else None
+                row[f"{v} Item No."]    = str(best.get("item_number", "—"))
+                row[f"{v} Description"] = str(best.get("item_description", "—"))[:60]
+                row[f"{v} Cost (USD)"]  = f"${float(vp):.2f}" if pd.notna(vp) and vp > 0 else "—"
+                row[f"{v} Cost (JMD)"]  = f"J${vp_jmd:,.0f}" if vp_jmd else "—"
+                row[f"{v} Match %"]     = f"{float(best.get('match_score', 0)):.0f}%"
                 has_any_match = True
                 if pd.notna(vp) and vp > 0:
                     if ino not in added_chart_pt and pt_cost:
-                        chart_rows.append({"Item": lbl, "Vendor": "Performance Tools",
+                        chart_rows.append({"Item": lbl, "Vendor": "Performance Tool",
                                            "Cost (USD)": pt_cost})
                         added_chart_pt.add(ino)
-                    vname = "Ronix (FOB)" if v == "Ronix" else v
-                    chart_rows.append({"Item": lbl, "Vendor": vname, "Cost (USD)": float(vp)})
+                    chart_rows.append({"Item": lbl, "Vendor": v, "Cost (USD)": float(vp)})
             else:
-                row[f"{v} Match"]      = "—"
-                row[f"{v} Cost (USD)"] = "—"
-                row[f"{v} Match %"]    = "—"
+                row[f"{v} Item No."]    = "—"
+                row[f"{v} Description"] = "—"
+                row[f"{v} Cost (USD)"]  = "—"
+                row[f"{v} Cost (JMD)"]  = "—"
+                row[f"{v} Match %"]     = "—"
 
         # Only include items that have at least one match
         if has_any_match:
@@ -1352,29 +1377,74 @@ def page_item_deep_dive(data, scores, preds):
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
+    # Load matched data early — needed for vendor cost reference lines
+    _matched_early = data.get("matched")
+
     # Avg selling price trend
     st.markdown("### Average Selling Price Trend (JMD)")
     st.markdown(
-        "<div class='chart-desc'><strong>What this shows:</strong> How the average "
-        "unit selling price for this item has changed each year. The red dashed line "
-        "is the current Workpro cost — any year where the green line dips below the "
-        "red line means you sold this item at a loss that year.</div>",
+        "<div class='chart-desc'><strong>What this shows:</strong> Your average selling "
+        "price each year (JMD, green line). Dashed lines show each vendor's cost "
+        "converted to JMD — any year the selling price sits below a vendor line "
+        "means you would sell at a loss sourcing from that vendor.</div>",
         unsafe_allow_html=True
     )
+    _boj_trend = load_boj_rate()
     ap_data = [(str(y), pd.to_numeric(row.get(f"avg_price_{y}", 0), errors="coerce") or 0)
                for y in YEARS if f"avg_price_{y}" in row.index]
     if ap_data:
-        df_ap = pd.DataFrame(ap_data, columns=["Year","Avg Price"])
-        df_ap = df_ap[df_ap["Avg Price"] > 0]
-        fig = px.line(df_ap, x="Year", y="Avg Price",
+        df_ap = pd.DataFrame(ap_data, columns=["Year", "Avg Selling Price (JMD)"])
+        df_ap = df_ap[df_ap["Avg Selling Price (JMD)"] > 0]
+        fig = px.line(df_ap, x="Year", y="Avg Selling Price (JMD)",
                       markers=True, color_discrete_sequence=["#16a34a"])
-        if pt_cost > 0:
-            fig.add_hline(y=pt_cost, line_dash="dash", line_color="#dc2626",
-                          annotation_text=f"Workpro Cost ${pt_cost:.2f}",
-                          annotation_position="bottom right")
+        if _boj_trend:
+            # Collect all reference lines: (label, jmd_value, line_color, dash_style)
+            _ref_lines = []
+            if pt_cost > 0:
+                _ref_lines.append(("PT Cost", pt_cost * _boj_trend, "#2563eb", "dash", pt_cost))
+
+            if _matched_early is not None and not _matched_early.empty:
+                _vm = _matched_early[_matched_early["sage_ITEMNO"].astype(str).str.strip() == item_no].copy()
+                _vm["vendor"] = _vm["vendor"].astype(str).str.strip().str.title()
+                for vname, vcolor in [("Workpro","#f59e0b"),("Metabo","#10b981"),("Ronix","#ef4444")]:
+                    _vm_v = _vm[_vm["vendor"] == vname]
+                    if not _vm_v.empty:
+                        _best = _vm_v.sort_values("match_score", ascending=False).iloc[0]
+                        _vp   = pd.to_numeric(_best.get("vendor_price_usd", None), errors="coerce")
+                        if pd.notna(_vp) and _vp > 0:
+                            _ref_lines.append((vname, _vp * _boj_trend, vcolor, "dot", float(_vp)))
+
+            # Sort lines by JMD value so labels stack cleanly
+            _ref_lines.sort(key=lambda x: x[1])
+
+            for _lbl, _jmd_val, _col, _dash, _usd_val in _ref_lines:
+                # Draw the line across the full plot
+                fig.add_shape(
+                    type="line", xref="paper", x0=0, x1=1,
+                    yref="y", y0=_jmd_val, y1=_jmd_val,
+                    line=dict(color=_col, width=1.5, dash=_dash),
+                )
+                # Add a clearly readable label on the LEFT side with background
+                fig.add_annotation(
+                    xref="paper", x=0.01,
+                    yref="y", y=_jmd_val,
+                    text=f"<b>{_lbl}</b>  J${_jmd_val:,.0f}  (${_usd_val:.2f})",
+                    showarrow=False,
+                    font=dict(color=_col, size=11, family="IBM Plex Mono"),
+                    bgcolor="#1a1814",
+                    bordercolor=_col,
+                    borderwidth=1,
+                    borderpad=4,
+                    xanchor="left",
+                    yanchor="bottom",
+                )
+
+            st.caption(f"All costs converted to JMD at J${_boj_trend:,.2f} per USD (BOJ rate)")
+        else:
+            st.caption("BOJ rate file not found — vendor cost lines unavailable")
         fig.update_xaxes(type="category")
-        fig.update_yaxes(tickprefix="$")
-        fig.update_layout(**plotly_defaults(), height=240)
+        fig.update_yaxes(tickprefix="J$", tickformat=",.0f")
+        fig.update_layout(**plotly_defaults(), height=360)
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("<hr>", unsafe_allow_html=True)
@@ -1388,7 +1458,7 @@ def page_item_deep_dive(data, scores, preds):
     cross    = data.get("cross")
     metabo   = data.get("metabo")
     ronix    = data.get("ronix")
-    workpro  = data.get("pt_cat")
+    workpro  = data.get("workpro")
 
     # ── Toggle: PT vs Vendors  |  Cross-Vendor ───────────────────────────────
     view_mode = st.radio(
@@ -1415,19 +1485,27 @@ def page_item_deep_dive(data, scores, preds):
                 st.info(f"No vendor matches found for item {item_no}. "
                         "It may not have reached the 80% match threshold.")
             else:
-                # Normalise vendor names
                 item_matches = item_matches.copy()
-                item_matches["vendor"] = item_matches["vendor"].astype(str).str.strip()
-                item_matches["vendor"] = item_matches["vendor"].replace({
-                    "CPL35": "Workpro", "CPL": "Workpro", "cpl": "Workpro",
-                    "metabo": "Metabo", "ronix": "Ronix",
-                })
+                item_matches["vendor"] = item_matches["vendor"].astype(str).str.strip().str.title()
 
-                bar_rows = []
-                if pt_cost > 0:
-                    bar_rows.append({"Vendor": "Performance Tools (current)",
-                                     "Cost (USD)": pt_cost, "Item": "PT Cost",
-                                     "Match %": "—", "Vendor Item": row.get("item_description","")})
+                _boj_cmp = load_boj_rate()
+
+                # Build table rows — one per vendor
+                table_rows = []
+                chart_rows = []
+
+                # PT row
+                pt_jmd = pt_cost * _boj_cmp if (pt_cost and _boj_cmp) else None
+                table_rows.append({
+                    "Vendor":        "Performance Tool",
+                    "Item No.":      str(row.get("ITEMNO", "")).strip(),
+                    "Description":   str(row.get("item_description", ""))[:60],
+                    "Cost (USD)":    f"${pt_cost:.2f}" if pt_cost else "—",
+                    "Cost (JMD)":    f"J${pt_jmd:,.0f}" if pt_jmd else "—",
+                    "Match %":       "—",
+                })
+                if pt_cost and _boj_cmp:
+                    chart_rows.append({"Vendor": "Performance Tool", "Cost (JMD)": pt_jmd})
 
                 for v in ["Workpro", "Metabo", "Ronix"]:
                     vm = item_matches[item_matches["vendor"] == v]
@@ -1435,45 +1513,52 @@ def page_item_deep_dive(data, scores, preds):
                         best = vm.sort_values("match_score", ascending=False).iloc[0]
                         vp   = pd.to_numeric(best.get("vendor_price_usd", None), errors="coerce")
                         if pd.notna(vp) and vp > 0:
-                            vname = f"{v} (FOB)" if v == "Ronix" else v
-                            bar_rows.append({
-                                "Vendor":      vname,
-                                "Cost (USD)":  float(vp),
-                                "Item":        str(best.get("item_description",""))[:60],
-                                "Match %":     f"{float(best.get('match_score',0)):.0f}%",
-                                "Vendor Item": str(best.get("item_number",""))
+                            vp_jmd = float(vp) * _boj_cmp if _boj_cmp else None
+                            table_rows.append({
+                                "Vendor":      v,
+                                "Item No.":    str(best.get("item_number", "—")),
+                                "Description": str(best.get("item_description", "—"))[:60],
+                                "Cost (USD)":  f"${float(vp):.2f}",
+                                "Cost (JMD)":  f"J${vp_jmd:,.0f}" if vp_jmd else "—",
+                                "Match %":     f"{float(best.get('match_score', 0)):.0f}%",
                             })
+                            if vp_jmd:
+                                chart_rows.append({"Vendor": v, "Cost (JMD)": vp_jmd})
 
-                if bar_rows:
-                    df_bar = pd.DataFrame(bar_rows)
-
-                    # Summary table
+                if table_rows:
+                    df_table = pd.DataFrame(table_rows)
+                    if _boj_cmp:
+                        st.caption(f"Costs converted at J${_boj_cmp:,.2f} per USD (BOJ rate)")
                     st.dataframe(
-                        df_bar[["Vendor","Cost (USD)","Match %","Vendor Item","Item"]],
-                        use_container_width=True, height=200
+                        df_table[["Vendor", "Item No.", "Description", "Cost (USD)", "Cost (JMD)", "Match %"]],
+                        use_container_width=True, height=max(150, (len(df_table) + 1) * 40)
                     )
 
-                    # Bar chart
-                    v_colors = {
-                        "Performance Tools (current)": "#2563eb",
-                        "Workpro":    "#f59e0b",
-                        "Metabo":     "#10b981",
-                        "Ronix (FOB)":"#ef4444",
-                    }
-                    fig_v = px.bar(
-                        df_bar, x="Vendor", y="Cost (USD)",
-                        color="Vendor", color_discrete_map=v_colors,
-                        text="Cost (USD)",
-                    )
-                    fig_v.update_traces(
-                        texttemplate="$%{text:.2f}", textposition="outside",
-                        marker_line_width=0, showlegend=False,
-                    )
-                    fig_v.update_yaxes(tickprefix="$", tickformat=",.2f")
-                    _pd_v = plotly_defaults()
-                    _pd_v["margin"] = dict(l=0, r=0, t=30, b=0)
-                    fig_v.update_layout(**_pd_v, height=300)
-                    st.plotly_chart(fig_v, use_container_width=True)
+                    # Bar chart in JMD (or USD fallback)
+                    if chart_rows:
+                        df_chart_v = pd.DataFrame(chart_rows)
+                        v_colors = {
+                            "Performance Tool": "#2563eb",
+                            "Workpro":          "#f59e0b",
+                            "Metabo":           "#10b981",
+                            "Ronix":            "#ef4444",
+                        }
+                        y_col   = "Cost (JMD)" if _boj_cmp else "Cost (USD)"
+                        pfx     = "J$" if _boj_cmp else "$"
+                        fig_v = px.bar(
+                            df_chart_v, x="Vendor", y=y_col,
+                            color="Vendor", color_discrete_map=v_colors,
+                            text=y_col,
+                        )
+                        fig_v.update_traces(
+                            texttemplate=f"{pfx}%{{text:,.0f}}", textposition="outside",
+                            marker_line_width=0, showlegend=False,
+                        )
+                        fig_v.update_yaxes(tickprefix=pfx, tickformat=",.0f")
+                        _pd_v = plotly_defaults()
+                        _pd_v["margin"] = dict(l=0, r=0, t=30, b=0)
+                        fig_v.update_layout(**_pd_v, height=320)
+                        st.plotly_chart(fig_v, use_container_width=True)
                 else:
                     st.info("No vendor prices available for this item.")
 
@@ -1752,7 +1837,8 @@ def page_vendor_comparison(data, scores):
         st.caption(f"Using pre-computed match file — {total_matched:,} PT items have vendor matches.")
 
         with st.spinner("Building table…"):
-            table_rows_df, chart_rows_df = build_vendor_match_table(data, sel_cat)
+            _boj_vc = load_boj_rate()
+            table_rows_df, chart_rows_df = build_vendor_match_table(data, sel_cat, boj_rate=_boj_vc)
 
         if table_rows_df.empty:
             st.info(
@@ -1768,9 +1854,9 @@ def page_vendor_comparison(data, scores):
         # ── Match table ──────────────────────────────────────────────────────
         matched_count = sum(
             1 for r in table_rows
-            if r.get("CPL Match","—") != "—"
-            or r.get("Metabo Match","—") != "—"
-            or r.get("Ronix Match","—") != "—"
+            if r.get("Workpro Description","—") != "—"
+            or r.get("Metabo Description","—") != "—"
+            or r.get("Ronix Description","—") != "—"
         )
         m1, m2, m3 = st.columns(3)
         for col, lbl, val in [
@@ -1798,7 +1884,7 @@ def page_vendor_comparison(data, scores):
                 "Performance Tools": "#2563eb",
                 "Workpro":           "#f59e0b",
                 "Metabo":            "#10b981",
-                "Ronix (FOB)":       "#ef4444",
+                "Ronix":       "#ef4444",
             }
             fig = px.bar(df_chart, x="Item", y="Cost (USD)", color="Vendor",
                          barmode="group", color_discrete_map=vendor_colors, text="Cost (USD)")
